@@ -1,5 +1,5 @@
 """
-围棋游戏逻辑 (9路)
+围棋游戏逻辑
 """
 import numpy as np
 from copy import deepcopy
@@ -242,6 +242,103 @@ def _legal_moves_and_mask(board, st, n, moves, mask):
         count += 1
         mask[total] = 1.0
     return count
+@njit(cache=True)
+def _liberty_channels(board, n, player, own_out, opp_out):
+    """己方/对方棋块气数通道：气数/4，上限1；空点或非本颜色为0。"""
+    labels = np.zeros((n, n), dtype=np.int32)      # 0=未访问/空，>0=组号
+    lib_seen = np.zeros(n * n, dtype=np.int32)     # 印记法去重（存组号）
+    lib = np.zeros(n * n + 1, dtype=np.int32)      # 每组的独立气数
+    stack = np.zeros(n * n, dtype=np.int32)
+    next_gid = 1
+    for r in range(n):
+        for c in range(n):
+            color = board[r, c]
+            if color == 0 or labels[r, c] != 0:
+                continue
+            gid = next_gid
+            next_gid += 1
+            top = 0
+            stack[top] = r * n + c
+            top += 1
+            labels[r, c] = gid
+            while top > 0:
+                top -= 1
+                cur = stack[top]
+                cr = cur // n
+                cc = cur % n
+                # 上
+                if cr > 0:
+                    nb = board[cr - 1, cc]
+                    if nb == 0:
+                        pos = (cr - 1) * n + cc
+                        if lib_seen[pos] != gid:
+                            lib_seen[pos] = gid
+                            lib[gid] += 1
+                    elif nb == color and labels[cr - 1, cc] == 0:
+                        labels[cr - 1, cc] = gid
+                        stack[top] = (cr - 1) * n + cc
+                        top += 1
+                # 下
+                if cr < n - 1:
+                    nb = board[cr + 1, cc]
+                    if nb == 0:
+                        pos = (cr + 1) * n + cc
+                        if lib_seen[pos] != gid:
+                            lib_seen[pos] = gid
+                            lib[gid] += 1
+                    elif nb == color and labels[cr + 1, cc] == 0:
+                        labels[cr + 1, cc] = gid
+                        stack[top] = (cr + 1) * n + cc
+                        top += 1
+                # 左
+                if cc > 0:
+                    nb = board[cr, cc - 1]
+                    if nb == 0:
+                        pos = cr * n + (cc - 1)
+                        if lib_seen[pos] != gid:
+                            lib_seen[pos] = gid
+                            lib[gid] += 1
+                    elif nb == color and labels[cr, cc - 1] == 0:
+                        labels[cr, cc - 1] = gid
+                        stack[top] = cr * n + (cc - 1)
+                        top += 1
+                # 右
+                if cc < n - 1:
+                    nb = board[cr, cc + 1]
+                    if nb == 0:
+                        pos = cr * n + (cc + 1)
+                        if lib_seen[pos] != gid:
+                            lib_seen[pos] = gid
+                            lib[gid] += 1
+                    elif nb == color and labels[cr, cc + 1] == 0:
+                        labels[cr, cc + 1] = gid
+                        stack[top] = cr * n + (cc + 1)
+                        top += 1
+    for r in range(n):
+        for c in range(n):
+            b = board[r, c]
+            if b == 0:
+                continue
+            v = lib[labels[r, c]] * 0.25
+            if v > 1.0:
+                v = 1.0
+            if b == player:
+                own_out[r, c] = v
+            else:
+                opp_out[r, c] = v
+def upgrade_state_channels(state, player=None):
+    """旧版4通道状态 → 6通道：根据 ch0/ch1 重建棋面并计算气数通道。
+
+    player: 该局面的当前玩家（±1）；缺省时由贴目通道符号推断。
+    """
+    n = state.shape[1]
+    if player is None:
+        player = 1 if state[3, 0, 0] > 0 else -1
+    board = np.where(state[0] > 0.5, 1, np.where(state[1] > 0.5, -1, 0)).astype(np.int8)
+    out = np.zeros((6, n, n), dtype=np.float32)
+    out[:4] = state
+    _liberty_channels(board, n, int(player), out[4], out[5])
+    return out
 
 @njit(cache=True)
 def _canonical_state(board, st, n, komi, player, out):
@@ -253,6 +350,9 @@ def _canonical_state(board, st, n, komi, player, out):
             out[1, r, c] = 1.0 if board[r, c] == -player else 0.0
             out[2, r, c] = 1.0 if (last_valid and st[1] == r and st[2] == c) else 0.0
             out[3, r, c] = kch
+    # 通道4=己方棋块气数/4（上限1），通道5=对方棋块气数/4（上限1）
+    _liberty_channels(board, n, player, out[4], out[5])
+
 
 class GoGame:
     """numba 加速版围棋（API 与 Python 版完全一致）"""
@@ -407,10 +507,11 @@ class GoGame:
     def get_canonical_state(self, player=None):
         if player is None:
             player = self._st[0]
-        out = np.zeros((4, self.board_size, self.board_size), dtype=np.float32)
+        out = np.zeros((6, self.board_size, self.board_size), dtype=np.float32)
         _canonical_state(self.board, self._st, self.board_size,
                             self.komi, int(player), out)
         return out
+
 
     def copy(self):
         g = GoGame.__new__(GoGame)

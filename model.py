@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 
 BOARD_SIZE = 13
-INPUT_CHANNELS = 4
+INPUT_CHANNELS = 6
 CHANNELS = 72
 NUM_RES_BLOCKS = 9
 DROPOUT_RATE = 0.1
@@ -194,16 +194,28 @@ class PolicyValueNet(nn.Module):
     @staticmethod
     def load_model(path, device='cpu'):
         checkpoint = torch.load(path, map_location=device, weights_only=False)
+        sd = checkpoint['model_state_dict']
+        old_in = sd['conv_input.weight'].shape[1]          # 旧权重实际输入通道数
         model = PolicyValueNet(
             board_size=checkpoint.get('board_size', BOARD_SIZE),
-            input_channels=checkpoint.get('input_channels', INPUT_CHANNELS),
+            input_channels=INPUT_CHANNELS,                 # ★ 强制当前通道数（6），不再读旧值
             channels=checkpoint.get('channels', CHANNELS),
             num_res_blocks=checkpoint.get('num_res_blocks', NUM_RES_BLOCKS),
             dropout_rate=checkpoint.get('dropout_rate', DROPOUT_RATE),
         )
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if old_in != model.input_channels:
+            # 兼容旧权重：旧通道装载到前 old_in 个，新增通道权重置零（初始输出与旧模型等价）
+            sd = dict(sd)
+            w = sd.pop('conv_input.weight')
+            new_w = torch.zeros(model.conv_input.weight.shape, dtype=w.dtype)
+            k = min(old_in, model.input_channels)
+            new_w[:, :k] = w[:, :k]
+            sd['conv_input.weight'] = new_w
+        model.load_state_dict(sd, strict=False)
         model.to(device)
         return model
+
+
 
     def export_onnx(self, path):
         self.eval()
@@ -232,10 +244,10 @@ def count_parameters(model):
 if __name__ == "__main__":
     model = PolicyValueNet()
     print(f"参数量: {count_parameters(model):,} ({count_parameters(model)/1e6:.2f}M)")
-    x = torch.randn(1, 4, 13, 13)
+    x = torch.randn(1, 6, 13, 13)
     p, v, o = model(x)
     print(f"策略输出: {p.shape}, 价值输出: {v.shape}, 归属输出: {o.shape}")
     
-    state = np.random.randn(4, 13, 13).astype(np.float32)
+    state = np.random.randn(6, 13, 13).astype(np.float32)
     policy, value = model.get_policy_value(state)
     print(f"策略维度: {policy.shape}, 价值: {value:.4f}")

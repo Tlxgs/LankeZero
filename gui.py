@@ -301,8 +301,7 @@ class GomokuGUI:
         if bw < W:
             self.win_canvas.create_rectangle(bw, 0, W, H, fill='white', outline='')
         self.win_canvas.create_rectangle(0, 0, W, H, outline='gray')
-        clamped = max(-0.9999, min(0.9999, black_win * 2 - 1))
-        self.win_label.config(text=f"黑棋: {SCALE*math.atanh(clamped):+.2f}")
+        self.win_label.config(text=f"黑胜率: {black_win*100:.1f}%|白胜率: {(1-black_win)*100:.1f}%")
 
     # ---------------- 目差 ----------------
 

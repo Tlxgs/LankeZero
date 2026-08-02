@@ -10,7 +10,7 @@ import os
 import pickle
 import glob
 from datetime import datetime
-from game import GoGame, PASS_MOVE,SCALE
+from game import GoGame, PASS_MOVE,SCALE,upgrade_state_channels
 from mcts import MCTS
 from model import PolicyValueNet
 
@@ -116,6 +116,8 @@ class TrainingData:
                 score_diff = info.get('score_diff', None)   # 兼容旧数据
                 
                 for i, (s, p, pl) in enumerate(zip(states, policies, players)):
+                    if s.shape[0] == 4:                    # 旧数据 4→6 通道升级
+                        s = upgrade_state_channels(s, pl)  # 用 players 里的真实玩家，精确重建气数
                     value = self._compute_value(winner, pl, score_diff)
                     own_view = self._compute_ownership_view(ownership_abs, pl)
                     all_data.append((s, p, value, own_view))
@@ -315,7 +317,6 @@ class SelfPlayTrainer:
         else:
             own_loss = torch.zeros((), device=self.device)
 
-        # === 价值-归属一致性损失（可能影响价值头独立决策，故暂时注释）===
         # 归属头求和 → 黑白绝对目差（不含贴目）；价值头是当前玩家视角、含贴目
         has_own = (own_target != 0).any(dim=(1, 2))             # (B,) 有归属标签的样本
         if has_own.any():
