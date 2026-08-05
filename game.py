@@ -5,14 +5,12 @@ import numpy as np
 from copy import deepcopy
 import math
 from numba import njit
-# ==================== 超参数 ====================
-BOARD_SIZE = 13
-KOMI = 7.5          # 贴目（白方补偿）
-MAX_MOVES = 200     # 最大步数防止死循环
-PASS_MOVE = (-1, -1)
-MIN_MOVES_BEFORE_PASS = 110   # 前n手不能Pass
-SCALE = 5
-PASS_LIMIT = 6
+# ==================== 超参数（统一配置见 hyperparams.py） ====================
+from hyperparams import (BOARD_SIZE, KOMI, MAX_MOVES, PASS_MOVE,
+                         MIN_MOVES_BEFORE_PASS, SCALE, PASS_LIMIT,
+                         SAFE_CAPTURE_PASSES)
+# 注意：MAX_MOVES / PASS_LIMIT / SAFE_CAPTURE_PASSES 被下方 @njit(cache=True)
+# 函数作为编译期常量捕获，改 hyperparams.py 后若不生效需删除 __pycache__/ 下 .nbc 缓存
 try:
     from numba import njit
     _HAS_NUMBA = True
@@ -244,7 +242,7 @@ def _legal_moves_and_mask(board, st, n, moves, mask):
     return count
 @njit(cache=True)
 def _liberty_channels(board, n, player, own_out, opp_out):
-    """己方/对方棋块气数通道：气数/4，上限1；空点或非本颜色为0。"""
+    """己方/对方棋块危急度通道：1气=1.0（最危急），>=4气=0（安全）；空点或非本颜色为0。"""
     labels = np.zeros((n, n), dtype=np.int32)      # 0=未访问/空，>0=组号
     lib_seen = np.zeros(n * n, dtype=np.int32)     # 印记法去重（存组号）
     lib = np.zeros(n * n + 1, dtype=np.int32)      # 每组的独立气数
@@ -319,26 +317,11 @@ def _liberty_channels(board, n, player, own_out, opp_out):
             b = board[r, c]
             if b == 0:
                 continue
-            v = lib[labels[r, c]] * 0.25
-            if v > 1.0:
-                v = 1.0
+            v = (4 - min(lib[labels[r, c]], 4)) / 3.0   # 危急度：1气=1.0最危急，>=4气=0安全
             if b == player:
                 own_out[r, c] = v
             else:
                 opp_out[r, c] = v
-def upgrade_state_channels(state, player=None):
-    """旧版4通道状态 → 6通道：根据 ch0/ch1 重建棋面并计算气数通道。
-
-    player: 该局面的当前玩家（±1）；缺省时由贴目通道符号推断。
-    """
-    n = state.shape[1]
-    if player is None:
-        player = 1 if state[3, 0, 0] > 0 else -1
-    board = np.where(state[0] > 0.5, 1, np.where(state[1] > 0.5, -1, 0)).astype(np.int8)
-    out = np.zeros((6, n, n), dtype=np.float32)
-    out[:4] = state
-    _liberty_channels(board, n, int(player), out[4], out[5])
-    return out
 
 @njit(cache=True)
 def _canonical_state(board, st, n, komi, player, out):
@@ -350,8 +333,408 @@ def _canonical_state(board, st, n, komi, player, out):
             out[1, r, c] = 1.0 if board[r, c] == -player else 0.0
             out[2, r, c] = 1.0 if (last_valid and st[1] == r and st[2] == c) else 0.0
             out[3, r, c] = kch
-    # 通道4=己方棋块气数/4（上限1），通道5=对方棋块气数/4（上限1）
+    # 通道4=己方棋块危急度（1气=1.0最危急），通道5=对方棋块危急度
     _liberty_channels(board, n, player, out[4], out[5])
+
+
+@njit(cache=True)
+def _life_death(board, g_label, n, g_color, g_adj_regions, g_adj_contact, g_adj_cnt,
+                ng, thresh, strength_eye):
+    """死活启发式：pass1潜力→眼判定→强度；pass2强度潜力→死棋判定；
+    最后加“气数硬判定”：气≤1的棋块必死（对手提子必合法：提后己方有气）。
+    返回 (alive int8[ng+1], g_eyes int32[ng+1] 每组眼区域数)。"""
+    max_r = g_adj_regions.shape[1]
+    bp = np.zeros(max_r, dtype=np.float64)
+    wp = np.zeros(max_r, dtype=np.float64)
+    strength = np.ones(ng + 1, dtype=np.float64)
+    for g in range(1, ng + 1):
+        for j in range(g_adj_cnt[g]):
+            rid = g_adj_regions[g, j]
+            pot = float(g_adj_contact[g, j])
+            if g_color[g] == 1:
+                bp[rid] += pot
+            else:
+                wp[rid] += pot
+    for g in range(1, ng + 1):
+        for j in range(g_adj_cnt[g]):
+            rid = g_adj_regions[g, j]
+            if g_color[g] == 1:
+                my = bp[rid]
+                op = wp[rid]
+            else:
+                my = wp[rid]
+                op = bp[rid]
+            if my - op >= thresh or (op == 0.0 and my > 0.0):
+                strength[g] = strength_eye
+                break
+    bp[:] = 0.0
+    wp[:] = 0.0
+    for g in range(1, ng + 1):
+        for j in range(g_adj_cnt[g]):
+            rid = g_adj_regions[g, j]
+            pot = strength[g] * float(g_adj_contact[g, j])
+            if g_color[g] == 1:
+                bp[rid] += pot
+            else:
+                wp[rid] += pot
+    alive = np.ones(ng + 1, dtype=np.int8)
+    g_eyes = np.zeros(ng + 1, dtype=np.int32)
+    for g in range(1, ng + 1):
+        eye_cnt = 0
+        for j in range(g_adj_cnt[g]):
+            rid = g_adj_regions[g, j]
+            if g_color[g] == 1:
+                my = bp[rid]
+                op = wp[rid]
+            else:
+                my = wp[rid]
+                op = bp[rid]
+            if my - op >= thresh or (op == 0.0 and my > 0.0):
+                eye_cnt += 1
+        g_eyes[g] = eye_cnt
+        if eye_cnt > 0:
+            continue
+        for j in range(g_adj_cnt[g]):
+            rid = g_adj_regions[g, j]
+            if g_color[g] == 1:
+                my = bp[rid]
+                op = wp[rid]
+            else:
+                my = wp[rid]
+                op = bp[rid]
+            if op - my >= thresh:
+                alive[g] = 0
+                break
+    # 气数硬判定：气≤1的棋块必死（1气可被直接提掉；0气不可能存在于合法盘面）。
+    # 修复“只剩一口气仍判活”——接触潜力模型无法表达“唯一气点=立即被提”。
+    g_libs = np.zeros(ng + 1, dtype=np.int32)
+    for r in range(n):
+        for c in range(n):
+            g = g_label[r, c]
+            if g > 0:
+                if r > 0 and board[r - 1, c] == 0:
+                    g_libs[g] += 1
+                if r < n - 1 and board[r + 1, c] == 0:
+                    g_libs[g] += 1
+                if c > 0 and board[r, c - 1] == 0:
+                    g_libs[g] += 1
+                if c < n - 1 and board[r, c + 1] == 0:
+                    g_libs[g] += 1
+    for g in range(1, ng + 1):
+        if g_libs[g] <= 1:
+            alive[g] = 0
+    return alive, g_eyes
+
+
+@njit(cache=True)
+def _group_size_liberties(board, n, r, c):
+    """BFS棋块(r,c)：返回(大小, 独立气数)。气用seen印记去重（同一空点只计一次）。"""
+    color = board[r, c]
+    seen = np.zeros(n * n, dtype=np.int8)   # 0=未访问 1=棋块点 2=空点已计气
+    stack = np.zeros(n * n, dtype=np.int32)
+    top = 0
+    stack[top] = r * n + c
+    top += 1
+    seen[r * n + c] = 1
+    size = 0
+    libs = 0
+    while top > 0:
+        top -= 1
+        cur = stack[top]
+        cr = cur // n
+        cc = cur % n
+        size += 1
+        # 上
+        if cr > 0:
+            nb = cur - n
+            v = board[cr - 1, cc]
+            if v == color:
+                if seen[nb] == 0:
+                    seen[nb] = 1
+                    stack[top] = nb
+                    top += 1
+            elif v == 0:
+                if seen[nb] == 0:
+                    seen[nb] = 2
+                    libs += 1
+        # 下
+        if cr < n - 1:
+            nb = cur + n
+            v = board[cr + 1, cc]
+            if v == color:
+                if seen[nb] == 0:
+                    seen[nb] = 1
+                    stack[top] = nb
+                    top += 1
+            elif v == 0:
+                if seen[nb] == 0:
+                    seen[nb] = 2
+                    libs += 1
+        # 左
+        if cc > 0:
+            nb = cur - 1
+            v = board[cr, cc - 1]
+            if v == color:
+                if seen[nb] == 0:
+                    seen[nb] = 1
+                    stack[top] = nb
+                    top += 1
+            elif v == 0:
+                if seen[nb] == 0:
+                    seen[nb] = 2
+                    libs += 1
+        # 右
+        if cc < n - 1:
+            nb = cur + 1
+            v = board[cr, cc + 1]
+            if v == color:
+                if seen[nb] == 0:
+                    seen[nb] = 1
+                    stack[top] = nb
+                    top += 1
+            elif v == 0:
+                if seen[nb] == 0:
+                    seen[nb] = 2
+                    libs += 1
+    return size, libs
+
+
+@njit(cache=True)
+def _flood_clear(board, n, sr, sc, color, dead):
+    """整块移除（提子），被移除的点写入dead（n,n布尔）。"""
+    stack = np.zeros(n * n, dtype=np.int32)
+    top = 0
+    stack[top] = sr * n + sc
+    top += 1
+    board[sr, sc] = 0
+    while top > 0:
+        top -= 1
+        cur = stack[top]
+        cr = cur // n
+        cc = cur % n
+        dead[cr, cc] = True
+        if cr > 0 and board[cr - 1, cc] == color:
+            board[cr - 1, cc] = 0
+            stack[top] = cur - n
+            top += 1
+        if cr < n - 1 and board[cr + 1, cc] == color:
+            board[cr + 1, cc] = 0
+            stack[top] = cur + n
+            top += 1
+        if cc > 0 and board[cr, cc - 1] == color:
+            board[cr, cc - 1] = 0
+            stack[top] = cur - 1
+            top += 1
+        if cc < n - 1 and board[cr, cc + 1] == color:
+            board[cr, cc + 1] = 0
+            stack[top] = cur + 1
+            top += 1
+
+
+@njit(cache=True)
+def _remove_adjacent_captured(board, n, r, c, color, dead):
+    """落子(r,c)后，提掉相邻的0气color棋块（提子只可能发生在4邻域）。"""
+    if r > 0 and board[r - 1, c] == color:
+        sz, libs = _group_size_liberties(board, n, r - 1, c)
+        if libs == 0:
+            _flood_clear(board, n, r - 1, c, color, dead)
+    if r < n - 1 and board[r + 1, c] == color:
+        sz, libs = _group_size_liberties(board, n, r + 1, c)
+        if libs == 0:
+            _flood_clear(board, n, r + 1, c, color, dead)
+    if c > 0 and board[r, c - 1] == color:
+        sz, libs = _group_size_liberties(board, n, r, c - 1)
+        if libs == 0:
+            _flood_clear(board, n, r, c - 1, color, dead)
+    if c < n - 1 and board[r, c + 1] == color:
+        sz, libs = _group_size_liberties(board, n, r, c + 1)
+        if libs == 0:
+            _flood_clear(board, n, r, c + 1, color, dead)
+
+
+@njit(cache=True)
+def _add_connection_points(board, n):
+    """连接点辅助局面：一遍扫描（就地修改board），在连接点放置对应方棋子。
+    连接点定义：某空点四邻中恰好 2个同方子+2个空位（四邻）；边点（3邻）为 2同方+1空；角点（2邻）永不是。
+    边扫描边落子：先落子的连接子会改变后续点的邻位构成，使其不再是连接点（符合用户定义）。
+    放置后所在棋块至少有2口气（定义保证），不会自杀。"""
+    for r in range(n):
+        for c in range(n):
+            if board[r, c] != 0:
+                continue
+            same_b = same_w = empty = total = 0
+            # 上
+            if r > 0:
+                total += 1
+                v = board[r - 1, c]
+                if v == 1:
+                    same_b += 1
+                elif v == -1:
+                    same_w += 1
+                else:
+                    empty += 1
+            # 下
+            if r < n - 1:
+                total += 1
+                v = board[r + 1, c]
+                if v == 1:
+                    same_b += 1
+                elif v == -1:
+                    same_w += 1
+                else:
+                    empty += 1
+            # 左
+            if c > 0:
+                total += 1
+                v = board[r, c - 1]
+                if v == 1:
+                    same_b += 1
+                elif v == -1:
+                    same_w += 1
+                else:
+                    empty += 1
+            # 右
+            if c < n - 1:
+                total += 1
+                v = board[r, c + 1]
+                if v == 1:
+                    same_b += 1
+                elif v == -1:
+                    same_w += 1
+                else:
+                    empty += 1
+            if total <= 2:
+                continue   # 角点（2邻）永不是连接点
+            if same_b == 2 and empty == total - 2:
+                board[r, c] = 1
+            elif same_w == 2 and empty == total - 2:
+                board[r, c] = -1
+
+
+@njit(cache=True)
+def _safe_capture_dead(board, n, attacker, max_passes=SAFE_CAPTURE_PASSES):
+    """安全点捕获法（用户方法第一步/第二步共用）：
+    攻击方只走“安全点”、迭代落子（防守方全程不落子），吃掉防守方死子。
+    安全点：落子后己方棋块<4子→恒安全（小块点眼杀棋）；棋块>=4子→气须>=2（防双活自陷）。
+    己方单眼不填：四邻全为己方棋/盘外的点跳过（填了自紧气，削弱后续攻击）。
+    只迭代 max_passes 轮（默认3）：1-2轮内吃掉的判死；多轮才吃掉≈已活（防守方不抵抗还拖多轮）→判活。
+    返回防守方被吃掉的死子掩码 (n,n) bool。"""
+    b = board.copy()
+    dead = np.zeros((n, n), dtype=np.bool_)
+    defender = -attacker
+    scratch = np.zeros((n, n), dtype=np.bool_)
+    # 无防守方棋子 → 无死子
+    has_def = False
+    for r in range(n):
+        for c in range(n):
+            if board[r, c] == defender:
+                has_def = True
+                break
+        if has_def:
+            break
+    if not has_def:
+        return dead
+    for _pass in range(max_passes):
+        placed = False
+        for r in range(n):
+            for c in range(n):
+                if b[r, c] != 0:
+                    continue
+                # 己方单眼不填：四邻全为己方棋/盘外 → 该点就是己方单眼，填了自紧气削弱后续攻击
+                if ((r == 0 or b[r - 1, c] == attacker) and
+                        (r == n - 1 or b[r + 1, c] == attacker) and
+                        (c == 0 or b[r, c - 1] == attacker) and
+                        (c == n - 1 or b[r, c + 1] == attacker)):
+                    continue
+                # 候选模拟：落子 → 提相邻防守子 → 算棋块大小/气
+                tmp = b.copy()
+                tmp[r, c] = attacker
+                scratch[:] = False
+                _remove_adjacent_captured(tmp, n, r, c, defender, scratch)
+                size, libs = _group_size_liberties(tmp, n, r, c)
+                if libs == 0:
+                    continue   # 自杀，非法点
+                if size >= 4 and libs < 2:
+                    continue   # 大块只剩1气，不安全（双活陷阱：谁填谁完蛋）
+                # 安全点 → 正式落子并吃子
+                b[r, c] = attacker
+                _remove_adjacent_captured(b, n, r, c, defender, dead)
+                placed = True
+        if not placed:
+            break
+    return dead
+
+
+@njit(cache=True)
+def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
+    """标记空区域并统计各区域邻接的黑/白（供领地/中立判定）。返回区域数nr（1-based）。"""
+    stack = np.zeros(n * n, dtype=np.int32)
+    nr = 0
+    for r in range(n):
+        for c in range(n):
+            if board[r, c] != 0 or r_label[r, c] != 0:
+                continue
+            nr += 1
+            r_size[nr] = 0
+            top = 0
+            stack[top] = r * n + c
+            top += 1
+            r_label[r, c] = nr
+            while top > 0:
+                top -= 1
+                cur = stack[top]
+                cr = cur // n
+                cc = cur % n
+                r_size[nr] += 1
+                # 上
+                if cr > 0:
+                    v = board[cr - 1, cc]
+                    if v == 0:
+                        if r_label[cr - 1, cc] == 0:
+                            r_label[cr - 1, cc] = nr
+                            stack[top] = cur - n
+                            top += 1
+                    elif v == 1:
+                        r_has_b[nr] = True
+                    else:
+                        r_has_w[nr] = True
+                # 下
+                if cr < n - 1:
+                    v = board[cr + 1, cc]
+                    if v == 0:
+                        if r_label[cr + 1, cc] == 0:
+                            r_label[cr + 1, cc] = nr
+                            stack[top] = cur + n
+                            top += 1
+                    elif v == 1:
+                        r_has_b[nr] = True
+                    else:
+                        r_has_w[nr] = True
+                # 左
+                if cc > 0:
+                    v = board[cr, cc - 1]
+                    if v == 0:
+                        if r_label[cr, cc - 1] == 0:
+                            r_label[cr, cc - 1] = nr
+                            stack[top] = cur - 1
+                            top += 1
+                    elif v == 1:
+                        r_has_b[nr] = True
+                    else:
+                        r_has_w[nr] = True
+                # 右
+                if cc < n - 1:
+                    v = board[cr, cc + 1]
+                    if v == 0:
+                        if r_label[cr, cc + 1] == 0:
+                            r_label[cr, cc + 1] = nr
+                            stack[top] = cur + 1
+                            top += 1
+                    elif v == 1:
+                        r_has_b[nr] = True
+                    else:
+                        r_has_w[nr] = True
+    return nr
 
 
 class GoGame:
@@ -528,49 +911,14 @@ class GoGame:
 
     # ---- 以下冷路径沿用纯 Python（只在终局/复盘时调用，不影响速度）----
     def compute_score(self):
-        board = self.board
-        alive = self._compute_alive_mask(board)
-        clean = np.where(alive, board, 0).astype(np.int8)
-        black_stones = int(np.sum(clean == 1))
-        white_stones = int(np.sum(clean == -1))
-        territory_black, territory_white = self._territory(clean)
-        black_score = black_stones + territory_black
-        white_score = white_stones + territory_white + self.komi
-        return black_score, white_score, black_score - white_score
+        data = self._merged_analysis()
+        # 中立区域（黑白边界）：归属0，目数黑白各0.5（目差中相互抵消）
+        black_score = data['black_stones'] + data['tb'] + 0.5 * data['neutral']
+        white_score = data['white_stones'] + data['tw'] + 0.5 * data['neutral'] + self.komi
+        return black_score, white_score, data['final_diff']
 
     def compute_ownership_absolute(self):
-        alive = self._compute_alive_mask(self.board)
-        clean = np.where(alive, self.board, 0).astype(np.int8)
-        own = clean.copy()
-        n = self.board_size
-        visited = np.zeros_like(clean, dtype=bool)
-        for r in range(n):
-            for c in range(n):
-                if clean[r, c] != 0 or visited[r, c]:
-                    continue
-                stack, pts = [(r, c)], []
-                visited[r, c] = True
-                black_adj = white_adj = 0
-                while stack:
-                    cr, cc = stack.pop()
-                    pts.append((cr, cc))
-                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nr, nc = cr + dr, cc + dc
-                        if 0 <= nr < n and 0 <= nc < n:
-                            if clean[nr, nc] == 0 and not visited[nr, nc]:
-                                visited[nr, nc] = True
-                                stack.append((nr, nc))
-                            elif clean[nr, nc] == 1:
-                                black_adj += 1
-                            elif clean[nr, nc] == -1:
-                                white_adj += 1
-                if black_adj > 0 and white_adj == 0:
-                    for p in pts:
-                        own[p] = 1
-                elif white_adj > 0 and black_adj == 0:
-                    for p in pts:
-                        own[p] = -1
-        return own
+        return self._merged_analysis()['own']
 
     def compute_ownership_map(self, player=None):
         own_abs = self.compute_ownership_absolute()
@@ -590,148 +938,75 @@ class GoGame:
         else:
             self.winner = 0
 
-    def _territory(self, board):
+    def _territory(self, board=None):
+        data = self._merged_analysis()
+        return data['tb'], data['tw']
+
+    # ---- 终局判定（安全点捕获法，取代接触潜力启发式/MCTS验证）----
+    def terminal_analysis(self):
+        """终局完整分析（训练标签用）：
+        安全点捕获法判定黑白死子 → 干净棋盘领地/归属。
+        更新 self.final_points / self.winner，返回绝对归属图 own(H,W int8)。"""
+        data = self._merged_analysis()
+        self._fp[0] = float(data['final_diff'])
+        self._st[9] = 1 if data['final_diff'] > 0 else (-1 if data['final_diff'] < 0 else 0)
+        return data['own']
+
+    def _compute_alive_mask(self, board=None):
+        return self._merged_analysis()['alive_mask']
+
+    def _merged_analysis(self):
+        """安全点捕获法（用户方法）：
+        0. 连接点辅助局面：原盘复制后一遍扫描放置连接子（防“本可随时连接却被分开吃掉”的活棋误判死）；
+        第一步 黑攻：在辅助局面上只走“安全点”迭代落子（白全程不落子），吃掉的白子=DeadWhiteMask；
+        第二步 白攻：白棋只走“安全点”迭代落子，吃掉的黑子=DeadBlackMask；
+        第三步：数目用原始棋局（连接子不在原盘上，MASK覆盖到它们无影响）：黑独占区域=黑地、白独占=白地、
+                黑白边界区域=中立（归属0，目数黑白各0.5，目差中相互抵消）。
+        安全点：落子后己方棋块<3子→恒安全（小块点眼杀棋）；棋块>=3子→须气>=2（防双活自陷）。"""
+        board = self.board
         n = self.board_size
-        visited = np.zeros_like(board, dtype=bool)
-        territory_black = territory_white = 0
+        # 连接点辅助局面：只用于算两个MASK，数目仍用原盘
+        aux = board.copy()
+        _add_connection_points(aux, n)
+        dead_white = _safe_capture_dead(aux, n, 1, SAFE_CAPTURE_PASSES)    # 黑攻 → 白死子
+        dead_black = _safe_capture_dead(aux, n, -1, SAFE_CAPTURE_PASSES)   # 白攻 → 黑死子
+        clean = board.copy()
+        clean[dead_white] = 0
+        clean[dead_black] = 0
+        black_stones = int(np.sum(clean == 1))
+        white_stones = int(np.sum(clean == -1))
+        # 干净棋盘区域分析：黑独占/白独占/中立
+        max_c = n * n
+        r_label = np.zeros((n, n), dtype=np.int32)
+        r_size = np.zeros(max_c + 1, dtype=np.int32)
+        r_has_b = np.zeros(max_c + 1, dtype=np.bool_)
+        r_has_w = np.zeros(max_c + 1, dtype=np.bool_)
+        nr = _regions_and_colors(clean, n, max_c, r_label, r_size, r_has_b, r_has_w)
+        tb = tw = neutral = 0
+        for rid in range(1, nr + 1):
+            if r_has_b[rid] and not r_has_w[rid]:
+                tb += int(r_size[rid])
+            elif r_has_w[rid] and not r_has_b[rid]:
+                tw += int(r_size[rid])
+            else:
+                neutral += int(r_size[rid])
+        # 归属图：活子±1；黑/白独占区域±1；中立=0
+        own = clean.copy().astype(np.int8)
         for r in range(n):
             for c in range(n):
-                if board[r, c] != 0 or visited[r, c]:
-                    continue
-                stack, pts = [(r, c)], []
-                visited[r, c] = True
-                black_adj = white_adj = 0
-                while stack:
-                    cr, cc = stack.pop()
-                    pts.append((cr, cc))
-                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nr, nc = cr + dr, cc + dc
-                        if 0 <= nr < n and 0 <= nc < n:
-                            if board[nr, nc] == 0 and not visited[nr, nc]:
-                                visited[nr, nc] = True
-                                stack.append((nr, nc))
-                            elif board[nr, nc] == 1:
-                                black_adj += 1
-                            elif board[nr, nc] == -1:
-                                white_adj += 1
-                if black_adj > 0 and white_adj == 0:
-                    territory_black += len(pts)
-                elif white_adj > 0 and black_adj == 0:
-                    territory_white += len(pts)
-        return territory_black, territory_white
-
-    def _analyze(self, board):
-        n = self.board_size
-        groups = []
-        point_to_group = {}
-        visited = np.zeros_like(board, dtype=bool)
-        for r in range(n):
-            for c in range(n):
-                if board[r, c] == 0 or visited[r, c]:
-                    continue
-                color = int(board[r, c])
-                stack, pts = [(r, c)], set()
-                visited[r, c] = True
-                while stack:
-                    cr, cc = stack.pop()
-                    pts.add((cr, cc))
-                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nr, nc = cr + dr, cc + dc
-                        if (0 <= nr < n and 0 <= nc < n and not visited[nr, nc]
-                                and board[nr, nc] == color):
-                            visited[nr, nc] = True
-                            stack.append((nr, nc))
-                gid = len(groups)
-                groups.append((color, frozenset(pts)))
-                for p in pts:
-                    point_to_group[p] = gid
-        regions = []
-        region_groups = []
-        group_regions = [[] for _ in groups]
-        point_to_region = {}
-        visited = np.zeros_like(board, dtype=bool)
-        for r in range(n):
-            for c in range(n):
-                if board[r, c] != 0 or visited[r, c]:
-                    continue
-                stack, pts, adj = [(r, c)], set(), set()
-                visited[r, c] = True
-                while stack:
-                    cr, cc = stack.pop()
-                    pts.add((cr, cc))
-                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nr, nc = cr + dr, cc + dc
-                        if 0 <= nr < n and 0 <= nc < n:
-                            if board[nr, nc] == 0 and not visited[nr, nc]:
-                                visited[nr, nc] = True
-                                stack.append((nr, nc))
-                            elif board[nr, nc] != 0:
-                                adj.add(point_to_group[(nr, nc)])
-                rid = len(regions)
-                regions.append(frozenset(pts))
-                region_groups.append(frozenset(adj))
-                for g in adj:
-                    group_regions[g].append(rid)
-                for p in pts:
-                    point_to_region[p] = rid
-        return groups, regions, region_groups, group_regions, point_to_region
-
-    def _compute_alive_mask(self, board):
-        THRESH = 3.0
-        STRENGTH = 10.0
-        n = self.board_size
-        groups, regions, region_groups, group_regions, point_to_region = self._analyze(board)
-        if not groups:
-            return np.zeros_like(board, dtype=bool)
-        contact = [{} for _ in groups]
-        for gid, (_, pts) in enumerate(groups):
-            for r, c in pts:
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < n and 0 <= nc < n and board[nr, nc] == 0:
-                        rid = point_to_region[(nr, nc)]
-                        contact[gid][rid] = contact[gid].get(rid, 0) + 1
-
-        def potentials(strength):
-            bp = np.zeros(len(regions))
-            wp = np.zeros(len(regions))
-            for rid, gids in enumerate(region_groups):
-                for gid in gids:
-                    pot = strength[gid] * contact[gid].get(rid, 0)
-                    if groups[gid][0] == 1:
-                        bp[rid] += pot
-                    else:
-                        wp[rid] += pot
-            return bp, wp
-
-        def has_eye(gid, bp, wp):
-            color = groups[gid][0]
-            for rid in group_regions[gid]:
-                my = bp[rid] if color == 1 else wp[rid]
-                op = wp[rid] if color == 1 else bp[rid]
-                if my - op >= THRESH or (op == 0 and my > 0):
-                    return True
-            return False
-
-        bp, wp = potentials(np.ones(len(groups)))
-        strength = np.array([STRENGTH if has_eye(g, bp, wp) else 1.0
-                                for g in range(len(groups))])
-        bp, wp = potentials(strength)
-        dead = set()
-        for gid in range(len(groups)):
-            color = groups[gid][0]
-            if has_eye(gid, bp, wp):
-                continue
-            if any((wp[rid] if color == 1 else bp[rid]) -
-                    (bp[rid] if color == 1 else wp[rid]) >= THRESH
-                    for rid in group_regions[gid]):
-                dead.add(gid)
-        mask = np.zeros_like(board, dtype=bool)
-        for gid, (_, pts) in enumerate(groups):
-            if gid not in dead:
-                for r, c in pts:
-                    mask[r, c] = True
-        return mask
+                rid = r_label[r, c]
+                if rid > 0:
+                    if r_has_b[rid] and not r_has_w[rid]:
+                        own[r, c] = 1
+                    elif r_has_w[rid] and not r_has_b[rid]:
+                        own[r, c] = -1
+        return {
+            'alive_mask': (clean != 0),
+            'own': own,
+            'tb': tb, 'tw': tw, 'neutral': neutral,
+            'black_stones': black_stones, 'white_stones': white_stones,
+            'final_diff': (black_stones + tb) - (white_stones + tw + self.komi),
+        }
 
     def get_terminal_value(self, player):
         if not self.game_over:
@@ -740,8 +1015,9 @@ class GoGame:
         cache_key = (board_hash, player)
         if cache_key in self._terminal_cache:
             return self._terminal_cache[cache_key]
-        scale = SCALE
-        value_base = math.fabs(np.tanh(self.final_points / scale))
+        # P0修复：终局回传原始目差（无界），与网络 value（ownership.sum()）同尺度。
+        # 旧版 /SCALE=10 会令搜索中终局分支的 Q 系统性偏小（官子不敏感、不主动终局）。
+        value_base = math.fabs(self.final_points)
         if self.winner == 0:
             value = 0.0
         else:

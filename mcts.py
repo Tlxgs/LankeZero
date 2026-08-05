@@ -3,37 +3,230 @@
 """
 import numpy as np
 import math
-import torch
-import torch.nn.functional as F
 import os
 from game import PASS_MOVE
-from model import PolicyValueNet
 
-os.environ["OMP_NUM_THREADS"] = "8"
+_torch_ready = False
+
+def _ensure_torch():
+    """延迟加载 torch：GUI 走 TRT numpy 路径时完全不加载 torch（省 ~1GB 内存）。
+    只有回退到 torch 推理时才导入并设置全局性能开关。"""
+    global _torch_ready
+    import torch
+    import torch.nn.functional as F
+    if not _torch_ready:
+        # ---- 推理/训练性能优化（全局生效）----
+        torch.backends.cudnn.benchmark = True          # cuDNN 自动选择最优卷积算法
+        torch.set_float32_matmul_precision('high')     # 矩阵乘允许 TF32（torch 内部）
+        _torch_ready = True
+    return torch, F
+
+from hyperparams import (BOARD_SIZE, C_PUCT, NUM_SIMULATIONS, TEMPERATURE, KOMI,
+                         DIRICHLET_ALPHA, DIRICHLET_EPSILON, VIRTUAL_LOSS,
+                         BATCH_SIZE_MCTS, MCTS_CAP, OMP_NUM_THREADS,
+                         TRT_WORKSPACE, TRT_OPT_LEVEL, TRT_FP16, ALPHA)
+os.environ["OMP_NUM_THREADS"] = str(OMP_NUM_THREADS)
 os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
 os.environ["OMP_DYNAMIC"] = "FALSE"
-
-C_PUCT = 1.5
-NUM_SIMULATIONS = 120
-TEMPERATURE = 0.0
-DIRICHLET_ALPHA = 0.2
-DIRICHLET_EPSILON = 0.30
-VIRTUAL_LOSS = 3
-BATCH_SIZE_MCTS = 16
-BOARD_SIZE = 13
 
 
 # ============================================================
 # 推理部分公共基类（torch 加载 + 单/批量推理 + pass bonus）
 # ============================================================
+def _setup_dll_paths():
+    """注册 CUDA/TensorRT/cuDNN 运行时 DLL 搜索路径（进程级，与启动方式无关）。
+    TensorRTModel 与 calibrate.py 共用。"""
+    dll_dirs = [
+        r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin',
+        r'D:\software\NVIDIA\cudnn-windows-x86_64-8.9.7.29_cuda12-archive\bin',  # cuDNN 8.9.7
+        r'C:\Program Files\NVIDIA',                      # cuDNN 8.x 备份位置
+        r'D:\software\tensorrt\TensorRT-8.6.1.6\lib',   # TensorRT 8.6
+    ]
+    # pip 版 NVIDIA 运行库自动探测（nvidia-cudnn-cu11/cu12、nvidia-cuda-runtime-cu11 等）
+    try:
+        import site as _site, glob as _glob
+        for _sp in _site.getsitepackages():
+            for _b in _glob.glob(os.path.join(_sp, 'nvidia', '*', 'bin')):
+                dll_dirs.append(_b)
+    except Exception:
+        pass
+    # torch 自带 CUDA/cuDNN 运行库（torch/lib，兜底；不 import torch，避免 GUI 进程加载 ~1GB）
+    try:
+        import site as _site, glob as _glob
+        for _sp in _site.getsitepackages():
+            for _d in _glob.glob(os.path.join(_sp, 'torch', 'lib')):
+                dll_dirs.append(_d)
+    except Exception:
+        pass
+    for d in dll_dirs:
+        if os.path.isdir(d):
+            try:
+                os.add_dll_directory(d)
+            except Exception:
+                pass
+            try:
+                # PATH 兜底：部分加载路径不认 add_dll_directory
+                os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+            except Exception:
+                pass
+    return dll_dirs
+
+
+class TensorRTModel:
+    """onnxruntime 推理封装（优先 TensorRT EP，自动回退 CUDA/CPU EP）。
+    接口与 torch 模型一致：__call__(x) -> (policy, value, ownership)，均为 torch 张量。
+    依赖 onnxruntime-gpu；未安装或加载失败时由调用方回退 torch 推理。"""
+    _executor_logged = False
+
+    def __init__(self, onnx_path, device='cuda', provider='auto'):
+        """provider: 'auto'/'trt'=TRT 优先（训练/评估，最快）；'cuda'=CUDA EP（GUI 默认，无引擎构建/缓存，
+        杜绝 TRT 缓存损坏导致的静默原生崩溃）；'cpu'=纯 CPU。均带自动降级。"""
+        _setup_dll_paths()
+        import onnxruntime as ort
+        # 日志压到 ERROR：每局新建会话，INT64→INT32 等 WARNING 会刷屏（0=VERBOSE 1=INFO 2=WARNING 3=ERROR 4=FATAL）
+        try:
+            ort.logging.set_default_logger_severity(3)
+        except Exception:
+            pass
+        available = ort.get_available_providers()
+        cache_dir = os.path.join(os.path.dirname(onnx_path), 'trt_cache')
+        trt_opts = {
+            'device_id': 0,
+            'trt_fp16_enable': TRT_FP16,
+            'trt_engine_cache_enable': True,
+            'trt_engine_cache_path': cache_dir,
+            'trt_max_workspace_size': TRT_WORKSPACE,    # 256MB workspace：构建期峰值内存减半，降低4GB显存下构建崩溃概率
+            'trt_builder_optimization_level': TRT_OPT_LEVEL,  # 3级：构建更快、内存更小，推理性能影响很小（引擎已缓存）
+            'trt_timing_cache_enable': True,            # 加速后续引擎重建
+            'trt_timing_cache_path': os.path.join(cache_dir, 'timing.cache'),
+        }
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 3
+        # 引擎缓存新鲜度自检：onnx 变更（如 13路→19路）后旧引擎会导致 ORT 原生崩溃，宁可删除重建
+        if provider in ('auto', 'trt'):
+            self._check_engine_cache(onnx_path, cache_dir, trt_opts)
+        # 分级尝试：TRT EP → CUDA EP → CPU EP（版本不匹配时自动降级，避免 ORT 内部报错刷屏）
+        candidates = []
+        if provider in ('auto', 'trt') and 'TensorrtExecutionProvider' in available:
+            candidates.append([('TensorrtExecutionProvider', trt_opts), 'CUDAExecutionProvider', 'CPUExecutionProvider'])
+        if provider in ('auto', 'trt', 'cuda') and 'CUDAExecutionProvider' in available:
+            candidates.append(['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        candidates.append(['CPUExecutionProvider'])
+        self.sess = None
+        last_err = None
+        for prov in candidates:
+            try:
+                self.sess = ort.InferenceSession(onnx_path, sess_options=sess_options, providers=prov)
+                # 会话创建后立即试跑一次：提前暴露引擎/输入形状不兼容（Python 层错误），失败换下一个执行器
+                self._warmup_run()
+                # ORT 会内部静默丢弃加载失败的 EP；只打印一次实际生效的执行器，避免每局刷屏
+                if not TensorRTModel._executor_logged:
+                    print(f'[TensorRTModel] 推理执行器: {self.sess.get_providers()}')
+                    TensorRTModel._executor_logged = True
+                break
+            except Exception as e:
+                last_err = e
+        if self.sess is None:
+            raise last_err
+        # 打印 onnx 输入形状（诊断"模型与棋盘尺寸不符"类问题）
+        try:
+            _inp = self.sess.get_inputs()[0]
+            print(f'[TensorRTModel] onnx输入: {_inp.name} shape={_inp.shape}')
+        except Exception:
+            pass
+        self.device = device
+
+    @staticmethod
+    def _check_engine_cache(onnx_path, cache_dir, trt_opts):
+        """onnx 变更（mtime/size）或构建选项变更时删除旧引擎缓存，
+        避免 ORT 加载不兼容引擎导致的原生崩溃（静默闪退）。"""
+        import json
+        meta_path = os.path.join(cache_dir, 'engine_meta.json')
+        try:
+            st = os.stat(onnx_path)
+            sig = {
+                'onnx': os.path.basename(onnx_path),
+                'mtime': st.st_mtime,
+                'size': st.st_size,
+                'workspace': trt_opts.get('trt_max_workspace_size'),
+                'opt_level': trt_opts.get('trt_builder_optimization_level'),
+            }
+            fresh = os.path.exists(meta_path) and json.load(open(meta_path, encoding='utf-8')) == sig
+            if not fresh:
+                import shutil
+                if os.path.isdir(cache_dir):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(sig, f)
+                print('[TensorRTModel] onnx 已变更，已清空旧 TRT 引擎缓存（将重建）')
+        except Exception:
+            pass
+
+    def _warmup_run(self):
+        """会话创建后立即用空输入试跑一次：提前暴露引擎/输入形状问题（失败抛异常 → 换下一个执行器）。"""
+        try:
+            inp = self.sess.get_inputs()[0]
+            shape = []
+            for s in inp.shape:
+                shape.append(1 if not isinstance(s, int) or s <= 0 else s)
+            self.sess.run(None, {inp.name: np.zeros(tuple(shape), dtype=np.float32)})
+        except Exception as e:
+            raise RuntimeError(f'推理试跑失败: {type(e).__name__}: {e}') from e
+
+    def eval(self):
+        return self
+
+    def __call__(self, x):
+        # 兼容接口：接受 torch 或 numpy (B,6,H,W)，返回 torch 张量（与 torch 模型一致）
+        if hasattr(x, 'detach'):          # torch 张量（不 import torch 也能识别）
+            x = x.detach().cpu().numpy()
+        out = self.sess.run(None, {'input': x})
+        import torch
+        return tuple(torch.from_numpy(o).to(self.device) for o in out)
+
+    def run_numpy(self, x):
+        """快速路径：numpy 直进直出（跳过 torch 往返），返回 (logits, value, ownership) numpy"""
+        return self.sess.run(None, {'input': x})
+
+    def get_policy_value_ownership(self, state, legal_mask=None, device='cpu'):
+        """与 PolicyValueNet 同名接口一致（GUI估值/归属/胜率显示用）：
+        返回 (policy, value, ownership, win_logit)：policy(362,) numpy、value float、
+        ownership(19,19) numpy ∈(-1,1)、win_logit float（胜率头 logit，tanh 后 = 当前玩家胜率 ±1）"""
+        if hasattr(state, 'detach'):
+            x = state.detach().cpu().numpy()
+        else:
+            x = np.asarray(state, dtype=np.float32)
+        if x.ndim == 3:
+            x = x[np.newaxis]
+        outs = self.sess.run(None, {'input': x})
+        logits, value, ownership_raw = outs[0], outs[1], outs[2]
+        win_logit = float(outs[3][0, 0]) if len(outs) > 3 else float('nan')  # 旧3输出 ONNX → logit缺失(NaN)，GUI显示50%
+        if legal_mask is not None:
+            mask = np.asarray(legal_mask, dtype=np.float32)
+            logits = logits.copy()
+            logits[:, mask == 0] = -1e4
+        e = np.exp(logits - logits.max(axis=1, keepdims=True))
+        policy = (e / e.sum(axis=1, keepdims=True))[0]
+        v = float(value[0, 0])
+        ownership = np.tanh(ownership_raw[0, 0])
+        return policy, v, ownership, win_logit   # win_logit 已在上方转为标量 float
+
+# 搜索树节点容量上限（numba 数组越界写会导致静默原生崩溃，必须给足余量）：
+# 训练默认 80万（≤1000模拟/步 × 361子节点 ≈43万，2倍余量）；GUI 按 GUI_MAX_SIMS×n²×1.2 传更大 cap（见 gui.py）
+# 统一配置：hyperparams.MCTS_CAP（保留 _CAP 别名，供外部脚本引用）
+_CAP = MCTS_CAP
+
 class _BaseMCTS:
     def __init__(self, c_puct=C_PUCT, num_simulations=NUM_SIMULATIONS,
-                 temperature=TEMPERATURE, onnx_path='model.onnx', device='cpu',
+                 temperature=TEMPERATURE, alpha=ALPHA, onnx_path='model.onnx', device='cpu',
                  dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_epsilon=DIRICHLET_EPSILON,
-                 board_size=BOARD_SIZE, batch_size=BATCH_SIZE_MCTS):
+                 board_size=BOARD_SIZE, batch_size=BATCH_SIZE_MCTS, provider='auto', cap=_CAP):
         self.c_puct = c_puct
+        self._cap = cap
         self.num_simulations = num_simulations
         self.temperature = temperature
+        self.alpha = alpha   # MCTS保守系数（GUI可运行时调整）
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
         self.board_size = board_size
@@ -43,33 +236,98 @@ class _BaseMCTS:
         model_path = onnx_path.replace('.onnx', '.pt')
         if not os.path.exists(model_path):
             model_path = 'model.pt'
-        self.device = device if torch.cuda.is_available() else 'cpu'
-        self.model = PolicyValueNet.load_model(model_path, device=self.device)
-        self.model.eval()
+        self._model_path = model_path   # TRT 失败时降级 torch 用
+        self.device = device
+        # 优先 TensorRT/onnxruntime 推理（TRT 走纯 numpy 路径，不需要 torch）；
+        # 只有 TRT 加载失败才回退 torch（延迟导入，GUI 场景省 ~1GB 内存）
+        self.model = None
+        if os.path.exists(onnx_path):
+            try:
+                self.model = TensorRTModel(onnx_path, device=self.device, provider=provider)
+            except Exception:
+                self.model = None
+        if self.model is None:
+            torch, _ = _ensure_torch()
+            from model import PolicyValueNet
+            self.device = device if torch.cuda.is_available() else 'cpu'
+            self.model = PolicyValueNet.load_model(model_path, device=self.device)
+            self.model.eval()
+
+    def _fallback_to_torch(self, err):
+        """TRT 推理失败 → 永久降级 torch 推理（GUI 不闪退、搜索不中断）。"""
+        if not isinstance(self.model, TensorRTModel):
+            return
+        torch, _ = _ensure_torch()
+        from model import PolicyValueNet
+        try:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.model = PolicyValueNet.load_model(self._model_path, device=self.device)
+            self.model.eval()
+            print(f'[MCTS] TRT 推理失败，已自动降级 torch 推理: {type(err).__name__}: {err}')
+        except Exception as e2:
+            self.model = None
+            print(f'[MCTS] 降级 torch 推理也失败: {type(e2).__name__}: {e2}')
 
     def _inference(self, state, legal_mask):
-        with torch.no_grad():
+        if isinstance(self.model, TensorRTModel):
+            try:
+                out = self.model.run_numpy(state.astype(np.float32, copy=False)[np.newaxis])
+                logits, value = out[0], out[1]   # 兼容旧3输出/新4输出 ONNX（胜率logit由_batch_inference使用）
+                v = float(value[0, 0])      # value = 期望领地目差（无界，领地头求和）
+                return self._process(logits[0], legal_mask, v), v
+            except Exception as e:
+                # TRT 引擎损坏/输入形状不匹配 → 永久降级 torch（防止搜索每步崩溃）
+                self._fallback_to_torch(e)
+                if self.model is None:
+                    raise
+        torch, _ = _ensure_torch()
+        with torch.inference_mode():
             t = torch.from_numpy(state).unsqueeze(0).to(self.device)
-            logits, value, _ = self.model(t)
-            policy = self._process(logits[0], legal_mask, value[0, 0].item())
-        return policy, value[0, 0].item()
+            logits, value, ownership, _ = self.model(t)
+            v = value[0, 0].item()          # value = 期望领地目差（无界，领地头求和）
+        policy = self._process(logits[0], legal_mask, v)
+        return policy, v
+
 
     def _batch_inference(self, states, legal_masks):
         n = len(states)
-        with torch.no_grad():
+        if isinstance(self.model, TensorRTModel):
+            try:
+                # TRT/ORT 快速路径：全程 numpy，跳过 torch 转换与 GPU 往返
+                x = np.stack(states).astype(np.float32, copy=False)
+                out = self.model.run_numpy(x)
+                logits, values = out[0], out[1]   # 兼容旧3输出/新4输出 ONNX
+                wls = out[3][:, 0] if len(out) > 3 else np.zeros(n, dtype=np.float32)  # 胜率logit（旧3输出ONNX无 →0）
+                mask = np.stack(legal_masks)
+                logits[mask == 0] = -1e4
+                logits -= logits.max(axis=1, keepdims=True)
+                p = np.exp(logits)
+                p /= p.sum(axis=1, keepdims=True)
+                v = values[:, 0]                    # 期望领地目差（无界，领地头求和）
+                for i in range(n):
+                    self._pass_bonus(p[i], legal_masks[i], v[i])
+                return list(p), v, wls
+            except Exception as e:
+                # TRT 引擎损坏/输入形状不匹配 → 永久降级 torch（防止搜索每步崩溃）
+                self._fallback_to_torch(e)
+                if self.model is None:
+                    raise
+        torch, F = _ensure_torch()
+        with torch.inference_mode():
             batch = torch.from_numpy(np.stack(states)).to(self.device)
             mask_t = torch.from_numpy(np.stack(legal_masks)).to(self.device)
-            logits, values, _ = self.model(batch)
+            logits, values, ownership, win_logits = self.model(batch)
             logits = logits.masked_fill(mask_t == 0, -1e4)
             probs = F.softmax(logits, dim=1)
             p = probs.cpu().numpy()
-            v = values[:, 0].cpu().numpy()
+            v = values[:, 0].cpu().numpy()      # 期望领地目差（无界，领地头求和）
+            wls = win_logits[:, 0].cpu().numpy()   # 胜率logit
         for i in range(n):
-            self._pass_bonus(p[i], legal_masks[i], v[i])
-        return list(p), v
+            self._pass_bonus(p[i], legal_masks[i], v[i])    # pass bonus 仍用有界胜率
+        return list(p), v, wls
 
     def _process(self, logits, legal_mask, value):
-        arr = logits.cpu().numpy().copy()
+        arr = logits.cpu().numpy().copy() if hasattr(logits, 'cpu') else logits.copy()
         if legal_mask is not None:
             arr[legal_mask == 0] = -1e8
         arr -= arr.max()
@@ -84,12 +342,7 @@ class _BaseMCTS:
         if legal_mask is None or legal_mask[pidx] != 1:
             return
         p = policy[pidx]
-        if p < 0.01:
-            p += 0.01
-        if value > 0.9:
-            p += 2 * value - 1.8
-        if value < -0.9:
-            p += 0.02
+        p +=0.005
         policy[pidx] = p
         policy /= policy.sum()
 
@@ -102,8 +355,6 @@ except Exception:
     _HAS_NUMBA = False
 
 if _HAS_NUMBA and _GAME_HAS_NUMBA:
-    _CAP = 1000000
-
     @njit(cache=True)
     def _select_child(cmove, cnode, cstart, ccount, visits, vsum, priors, vloss,
                       node, c_puct, move_count, n):
@@ -115,22 +366,34 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
             pv = vsum[node] / visits[node]
         else:
             pv = 0.0
-        EXPLORE=0.02
-        optimism = EXPLORE - 0.1 * math.log(1.00001 + pv)
+
+        # ---- Q min-max 归一化（KataGo风格）：适配无界混合值，探索项与Q同尺度 ----
+        qmin = 1e18
+        qmax = -1e18
+        for s in range(start, end):
+            ch = cnode[s]
+            vis = visits[ch]
+            q = -vsum[ch] / vis if vis > 0 else pv
+            if q < qmin:
+                qmin = q
+            if q > qmax:
+                qmax = q
+        qdiff = qmax - qmin
+        qscale = 0.0 if qdiff < 1e-6 else 1.0 / qdiff
+
         sqrt_n = math.sqrt(1.0 + visits[node] + vloss[node])
-        late = move_count > 150
-        b = 0.001 * (move_count - 150) if late else 0.0
+        late = move_count > 300
+        b = 0.0002 * (move_count - 300) if late else 0.0
         pass_move = n * n
         best_slot = start
         best_score = -1e18
         for s in range(start, end):
             ch = cnode[s]
             vis = visits[ch]
-            if vis == 0:
-                q = pv + optimism
-            else:
-                q = -vsum[ch] / vis + optimism / (1.0 + vis)
-            score = q + c_puct * priors[ch] * sqrt_n / (1.0 + vis + vloss[ch])
+            # 子节点自身价值（视角取反）；未访问用父均值基准
+            q = -vsum[ch] / vis if vis > 0 else pv
+            qn = 0.5 if qdiff < 1e-6 else (q - qmin) * qscale   # 归一化到[0,1]
+            score = qn + c_puct * priors[ch] * sqrt_n / (1.0 + vis + vloss[ch])
             if late and cmove[s] == pass_move:
                 score += b
             if score > best_score:
@@ -308,12 +571,12 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
 
     class MCTS(_BaseMCTS):
         def __init__(self, c_puct=C_PUCT, num_simulations=NUM_SIMULATIONS,
-                     temperature=TEMPERATURE, onnx_path='model.onnx', device='cpu',
+                     temperature=TEMPERATURE, alpha=ALPHA, onnx_path='model.onnx', device='cpu',
                      dirichlet_alpha=DIRICHLET_ALPHA, dirichlet_epsilon=DIRICHLET_EPSILON,
-                     board_size=BOARD_SIZE, batch_size=BATCH_SIZE_MCTS):
-            super().__init__(c_puct, num_simulations, temperature, onnx_path, device,
-                             dirichlet_alpha, dirichlet_epsilon, board_size, batch_size)
-            CAP = _CAP
+                     board_size=BOARD_SIZE, batch_size=BATCH_SIZE_MCTS, provider='auto', cap=_CAP):
+            super().__init__(c_puct, num_simulations, temperature, alpha, onnx_path, device,
+                             dirichlet_alpha, dirichlet_epsilon, board_size, batch_size, provider, cap)
+            CAP = cap
             self._parent = np.full(CAP, -1, dtype=np.int32)
             self._cstart = np.zeros(CAP, dtype=np.int32)
             self._ccount = np.zeros(CAP, dtype=np.int32)
@@ -335,6 +598,7 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
             self._s_cmove = np.zeros(CAP, dtype=np.int32)
             self._s_cnode = np.zeros(CAP, dtype=np.int32)
             self._root = None
+            self._root_key = None   # 根节点对应的局面指纹（current_player + board）
             self.root = None
 
         def _idx(self, move):
@@ -342,7 +606,12 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 return self.pass_idx
             return move[0] * self.board_size + move[1]
 
+        def _game_key(self, game):
+            """局面指纹：当前玩家 + 棋盘字节。用于校验树根与局面一致（评估对局双模型交替时防止错位）"""
+            return (game.current_player, game.board.tobytes())
+
         def init_root(self, game):
+            self._root_key = self._game_key(game)
             legal_moves, legal_mask = game.get_legal_moves_and_mask()
             if not legal_moves:
                 self._root = None
@@ -400,6 +669,7 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                     break
             if found >= 0:
                 self._root = found
+                self._root_key = self._game_key(game)   # 根节点推进到新局面
                 self._compact()          # 每步压缩一次，回收死分支，保持容量
             else:
                 self.init_root(game)
@@ -416,10 +686,20 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
         def simulate_batch(self, game, n):
             if self._root is None:
                 return
-            if self._next[0] > _CAP - 20000:     # 安全网（正常每步已压缩，不会触发）
-                self._compact()
             remaining = n
             while remaining > 0:
+                # ---- 节点容量安全网 ----
+                # 19路 每展开一个叶子最多新建 n² 个子节点，长搜索会撑爆容量数组：
+                # 越界写 → 静默原生崩溃（无任何 Python 报错）。
+                # 注意：_compact 只对"落子后的子树"有效；当前根即整棵树时压缩无效，必须重建树根。
+                # 容量按场景区分（训练 _CAP=80万 / GUI GUI_CAP≈433万），此处是超出容量后的兜底。
+                if self._next[0] > self._cap - 20000:
+                    self._compact()
+                    if self._next[0] > self._cap - 20000:
+                        self.init_root(game)   # 重建树根（1次推理），搜索继续不中断
+                        print(f'[MCTS] 树节点达到容量上限，已重建树根（剩余 {remaining} 模拟）')
+                        if self._root is None:
+                            return
                 batch = min(self.batch_size, remaining)
                 sims = []
                 for _ in range(batch):
@@ -434,13 +714,15 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 nn = [i for i, s in enumerate(sims) if not s[2]]
                 policies = [None] * len(sims)
                 values = [None] * len(sims)
+                wls = [None] * len(sims)   # 叶子胜率logit（网络输出）
                 if nn:
                     states = [sims[i][1].get_canonical_state() for i in nn]
                     masks = [sims[i][1].get_legal_moves_and_mask()[1] for i in nn]
-                    ps, vs = self._batch_inference(states, masks)
+                    ps, vs, xw = self._batch_inference(states, masks)
                     for j, i in enumerate(nn):
                         policies[i] = ps[j]
                         values[i] = vs[j]
+                        wls[i] = xw[j]
                 for i, (leaf, gc, is_term, path, plen) in enumerate(sims):
                     if is_term:
                         if gc.winner is None:
@@ -452,6 +734,11 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                         value = values[i]
                         policy = policies[i]
                         has_policy = 1
+                        # 胜率logit 与归属头目差（含贴目，平局=0）线性混合；混合值进 vsum，
+                        # 由 _select_child 的 Q min-max 归一化（KataGo式）适配尺度后用于选择。
+                        # α=0 → 纯胜率logit；α=1 → 纯目差（归属头求和 + komi，当前玩家视角）。
+                        score = value - KOMI * gc.current_player
+                        value = (1.0 - self.alpha) * wls[i] + self.alpha * score
                     _backup_np(
                         gc.board, gc._st, gc._go, gc._fp, gc._cap,
                         self._parent, self._cstart, self._ccount, self._cmove, self._cnode,
@@ -464,8 +751,8 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
         def get_move_probs(self, game, temp=None, target_visits=1):
             if temp is None:
                 temp = self.temperature
-            if self._root is None:
-                self.init_root(game)
+            if self._root is None or self._root_key != self._game_key(game):
+                self.init_root(game)   # 局面不匹配（如评估对局双模型交替）则重建树
             if self._root is None:
                 return {}
             current = int(self._visits[self._root])
