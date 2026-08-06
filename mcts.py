@@ -436,7 +436,6 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
             return node, 1, path_len      # 终局
         return node, 0, path_len          # 叶节点（待展开）
 
-    # ---------- 回溯+展开（等价原 _simulate_backup）----------
     @njit(cache=True)
     def _backup_np(board, st, go, fp, cap,
                    parent, cstart, ccount, cmove, cnode,
@@ -621,9 +620,7 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
             policy, _ = self._inference(state, legal_mask)
             moves = list(legal_moves)
             probs = np.array([policy[self._idx(m)] for m in moves], dtype=np.float32)
-            noise = np.random.dirichlet([self.dirichlet_alpha] * len(moves))
-            mixed = (1 - self.dirichlet_epsilon) * probs + self.dirichlet_epsilon * noise
-            mixed /= mixed.sum()
+            probs /= probs.sum()   # 先验归一化；噪声统一在每次搜索前由 _add_dirichlet_noise 混入
             self._parent[:] = -1
             self._cstart[:] = 0
             self._ccount[:] = 0
@@ -645,7 +642,7 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 self._ccount[new_id] = 0
                 self._visits[new_id] = 0
                 self._vsum[new_id] = 0.0
-                self._priors[new_id] = mixed[i]
+                self._priors[new_id] = probs[i]
                 self._vloss[new_id] = 0
                 self._expanded[new_id] = 0
                 slot = self._cpool[0]
@@ -655,6 +652,28 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
             self._ccount[root] = len(moves)
             self._root = root
             self.root = _RootView(self)
+
+        def _add_dirichlet_noise(self):
+            """搜索前给根节点先验混入 Dirichlet 噪声（仅根/复用根，搜索展开的子节点不加）。
+
+            树跨局、跨步复用：init_root 只在重建时发生，update_root 推进根后先验是旧值——
+            若只在开局 init_root 加一次，之后每步搜索都无探索噪声。
+            因此每次 get_move_probs 搜索前都重新混入，保证每步棋的根都有噪声。
+            """
+            if self._root is None or self.dirichlet_epsilon <= 0.0:
+                return
+            root = self._root
+            cnt = self._ccount[root]
+            if cnt == 0:
+                return
+            noise = np.random.dirichlet([self.dirichlet_alpha] * cnt)
+            i = 0
+            for s in range(self._cstart[root], self._cstart[root] + cnt):
+                child = self._cnode[s]
+                p = self._priors[child]
+                self._priors[child] = ((1.0 - self.dirichlet_epsilon) * p
+                                       + self.dirichlet_epsilon * noise[i])
+                i += 1
 
         def update_root(self, game, last_move):
             if self._root is None:
@@ -727,7 +746,18 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                     if is_term:
                         if gc.winner is None:
                             gc._compute_winner()
-                        value = 0.0 if gc.winner == 0 else gc.get_terminal_value(gc.current_player)
+                        # 终局（双PASS/超时）：与网络输出套用同一混合公式（同尺度），
+                        # 否则纯目差 ±|final_points|（无界，常达±50+）相对混合值
+                        # (1-α)·win_logit+α·score（≈±4）是极端 outlier，会拉伸 min-max
+                        # 归一化区间、压扁中间层 Q 分辨率，令 PUCT 探索相对增强、选择失真。
+                        # 胜率部分：±10 近似满胜率 logit（tanh(±10)≈±1）；
+                        # 目差部分：当前玩家视角含贴目目差（无界，与网络 value 同尺度）。
+                        if gc.winner == 0:
+                            value = 0.0
+                        else:
+                            term_score = gc.final_points * gc.current_player
+                            term_wl = 6.0 if gc.winner == gc.current_player else -6.0
+                            value = (1.0 - self.alpha) * term_wl + self.alpha * term_score
                         policy = np.zeros(0, dtype=np.float32)
                         has_policy = 0
                     else:
@@ -737,7 +767,9 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                         # 胜率logit 与归属头目差（含贴目，平局=0）线性混合；混合值进 vsum，
                         # 由 _select_child 的 Q min-max 归一化（KataGo式）适配尺度后用于选择。
                         # α=0 → 纯胜率logit；α=1 → 纯目差（归属头求和 + komi，当前玩家视角）。
-                        score = value - KOMI * gc.current_player
+                        # 注意：归属头求和=当前玩家无贴目目差，含贴目目差 = 其 + KOMI·player
+                        # （黑 +KOMI，白 -KOMI）；与上方终局 term_score 同基准。
+                        score = value + KOMI * gc.current_player
                         value = (1.0 - self.alpha) * wls[i] + self.alpha * score
                     _backup_np(
                         gc.board, gc._st, gc._go, gc._fp, gc._cap,
@@ -755,6 +787,7 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 self.init_root(game)   # 局面不匹配（如评估对局双模型交替）则重建树
             if self._root is None:
                 return {}
+            self._add_dirichlet_noise()   # 每次搜索前给根先验混入噪声（复用根同样生效）
             current = int(self._visits[self._root])
             remaining = max(1, target_visits - current)
             while remaining > 0:

@@ -18,7 +18,6 @@ import pickle
 import glob
 from datetime import datetime
 from game import PASS_MOVE, SCALE
-from mcts import MCTS
 from model import PolicyValueNet
 
 # ==================== 超参数（统一配置见 hyperparams.py） ====================
@@ -28,8 +27,6 @@ from hyperparams import (BOARD_SIZE, NUM_SIMULATIONS, C_PUCT,
                          ENTROPY_WEIGHT, OWN_WEIGHT, WIN_WEIGHT, GRAD_CLIP_NORM,
                          DATA_DIR, MODEL_PATH, ONNX_PATH,
                          TRAINING_DATA_MAX)
-# Eval（当前vs最佳）已独立到 eval.py：独立进程运行，训练不再内嵌评估（防阻塞/卡死）
-# 评估对局数据由 eval.py 原子写入数据目录，训练 load_all 时自动纳入
 
 class TrainingData:
     def __init__(self, max_size=TRAINING_DATA_MAX, data_dir=DATA_DIR,board_size=BOARD_SIZE):
@@ -79,6 +76,13 @@ class TrainingData:
     def __len__(self):
         return len(self.data)
 
+    def __iter__(self):
+        # 支持 list(training_data) 遍历 / td[idx] 按索引访问
+        return iter(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
     def save_game(self, game_data):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filepath = os.path.join(self.data_dir, f"data_{timestamp}.pkl")
@@ -110,8 +114,8 @@ class TrainingData:
                 policies = info['policies']
                 players = info['players']
                 winner = info['winner']
-                ownership_abs = info.get('ownership', None) 
-                score_diff = info.get('score_diff', None)   # 兼容旧数据
+                ownership_abs = info['ownership']
+                score_diff = info['score_diff']
 
                 
                 for i, (s, p, pl) in enumerate(zip(states, policies, players)):
@@ -134,8 +138,8 @@ class TrainingData:
             info = pickle.load(fp)
         added = 0
         for s_, p, pl in zip(info['states'], info['policies'], info['players']):
-            value = self._compute_value(info['winner'], pl, info.get('score_diff', None))
-            own_view = self._compute_ownership_view(info.get('ownership', None), pl)
+            value = self._compute_value(info['winner'], pl, info['score_diff'])
+            own_view = self._compute_ownership_view(info['ownership'], pl)
             self.data.append((s_, p, value, own_view))
             added += 1
         print(f"[数据] 已从 {os.path.basename(filename)} 加载 {added} 条数据")
@@ -153,7 +157,7 @@ class SelfPlayTrainer:
                  data_dir=DATA_DIR, c_puct=C_PUCT,
                  learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
                  optimizer_name=OPTIMIZER_NAME, momentum=MOMENTUM,
-                 freeze_parts=None):
+                 freeze_parts=None, reset_bn=False):
         """freeze_parts: 冻结参数规格（None/''=不冻结），格式见 PolicyValueNet.freeze_parts，
         例如 '0,1,2,3,5,7'（冻结这些残差块）或 '0,own,policy'（冻结块0+归属头+策略头）。"""
         self.model_path = model_path
@@ -168,7 +172,7 @@ class SelfPlayTrainer:
         self.momentum = momentum
         os.makedirs(data_dir, exist_ok=True)
 
-        self.model = PolicyValueNet.load_model(model_path).to(device)
+        self.model = PolicyValueNet.load_model(model_path, reset_bn=reset_bn).to(device)
         self.frozen_params_count = 0
         if freeze_parts:
             # 在创建优化器之前冻结：优化器只挂载可训练参数（Adam/SGD 均不更新冻结层）
@@ -186,22 +190,29 @@ class SelfPlayTrainer:
 
     def _build_optimizer(self):
         """按优化器类型创建优化器（Adam/SGD，SGD含动量）。
-        只挂载 requires_grad=True 的参数：冻结层不参与更新（见 freeze_parts）。"""
-        params = [p for p in self.model.parameters() if p.requires_grad]
+        只挂载 requires_grad=True 的参数：冻结层不参与更新（见 freeze_parts）。
+        KataGo 惯例：所有 1D 参数（bias + BatchNorm 的 weight/bias）不参与 weight decay——
+        BN 的 affine 缩放会被后续层抵消，对其正则化无意义，且会持续缩小有效表达。"""
+        decay, no_decay = [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if p.ndim <= 1 else decay).append(p)
+        groups = [
+            {'params': decay, 'weight_decay': self.weight_decay, 'wd_enabled': True},
+            {'params': no_decay, 'weight_decay': 0.0, 'wd_enabled': False},
+        ]
         if self.optimizer_name == 'sgd':
-            return torch.optim.SGD(params,
-                                  lr=self.learning_rate, momentum=self.momentum,
-                                  weight_decay=self.weight_decay)
-        return torch.optim.Adam(params,
-                               lr=self.learning_rate, weight_decay=self.weight_decay)
-    def _augment_batch(self, states, policies, values, ownerships):
+            return torch.optim.SGD(groups, lr=self.learning_rate, momentum=self.momentum)
+        return torch.optim.Adam(groups, lr=self.learning_rate)
+    @staticmethod
+    def _augment_batch(states, policies, values, ownerships, board_size):
         """数据增强：对策略向量只变换棋盘部分，pass维度保持不变。
         使用完整的 D4 对称群（8 种变换），state / policy / ownership 使用完全一致的坐标变换。
         values（±1 胜负标签）为标量：8 种几何变换不变；黑白互换（视角翻转）时必须取反，
         否则一半样本标签符号错误 →胜率头被迫输出0（损失恒为1.0）。
         """
         batch_size = states.shape[0]
-        board_size = self.board_size
         n = board_size * board_size
 
         transforms = [
@@ -291,8 +302,8 @@ class SelfPlayTrainer:
         if len(self.data_buffer) < batch_size:
             return None, None, None, None, None
         states, policies, values, ownerships = self.data_buffer.sample(batch_size)
-        states, policies, values, ownerships = self._augment_batch(
-            states, policies, values, ownerships)
+        states, policies, values, ownerships = SelfPlayTrainer._augment_batch(
+            states, policies, values, ownerships, self.board_size)
         states_t = torch.FloatTensor(states).to(self.device)
         policies_t = torch.FloatTensor(policies).to(self.device)
 
@@ -366,7 +377,8 @@ class SelfPlayTrainer:
         if 'weight_decay' in kwargs:
             self.weight_decay = kwargs['weight_decay']
             for g in self.optimizer.param_groups:
-                g['weight_decay'] = self.weight_decay
+                if g.get('wd_enabled', True):   # 只更新衰减组；BN/bias 组恒为 0（KataGo 惯例）
+                    g['weight_decay'] = self.weight_decay
         rebuild = False
         if 'optimizer_name' in kwargs and kwargs['optimizer_name'].lower() != self.optimizer_name:
             self.optimizer_name = kwargs['optimizer_name'].lower()
@@ -382,3 +394,4 @@ class SelfPlayTrainer:
             self.c_puct = kwargs['c_puct']
         if 'num_simulations' in kwargs:
             self.num_simulations = kwargs['num_simulations']
+

@@ -9,10 +9,11 @@ import subprocess
 import sys
 import pickle
 import struct
+from array import array
+from collections import deque
 from datetime import datetime
-from selfplay import worker_process   # 数据生成 worker（纯生成，不加载 torch）
+from selfplay import worker_process 
 from ui_utils import GameBoard, TrainingStatsPanel
-import numpy as np
 import ctypes
 ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 让Tkinter使用DirectX渲染
 
@@ -22,13 +23,34 @@ from hyperparams import (BOARD_SIZE, ONNX_PATH, MODEL_PATH, DATA_DIR,
                          EXPLORATION_MODE, BATCH_SIZE, SAVE_INTERVAL,
                          TRAIN_GAMES, LEARNING_RATE,
                          WEIGHT_DECAY, MOMENTUM, OPTIMIZER_NAME, EVAL_GAMES,
-                         UI_UPDATE_BATCHES, SAVE_INTERVAL_BATCHES, ALPHA)
+                         UI_UPDATE_BATCHES, SAVE_INTERVAL_BATCHES, ALPHA,
+                         TRAIN_STEPS_PER_GAME)
+
+MAX_REPLAY_GAMES = 200   # 对局回放历史上限（deque 滚动，防内存无限增长）
 
 class GameResult:
+    __slots__ = ('game_id', 'moves', 'winner')
+
     def __init__(self, game_id, moves, winner):
         self.game_id = game_id
-        self.moves = moves 
         self.winner = winner
+        # 回放内存优化：moves 压缩为 array('h')，每手一个 int 编码
+        # （pass=0；(r,c) → (r+1)*N+(c+1)，N=BOARD_SIZE+1），不再保留 (r,c,pl) 三元组列表
+        n = BOARD_SIZE + 1
+        arr = array('h')
+        for m in moves:
+            r, c = m[0], m[1]
+            if (r, c) == (-1, -1):
+                arr.append(0)
+            else:
+                arr.append((r + 1) * n + (c + 1))
+        self.moves = arr
+
+    def get_moves(self):
+        """解码为 (r, c) 列表（仅回放用；只保留当前正在看的一局，切换后即释放）。"""
+        n = BOARD_SIZE + 1
+        return [((-1, -1) if code == 0 else (code // n - 1, code % n - 1))
+                for code in self.moves]
 
 class TrainingGUI:
     def __init__(self):
@@ -41,9 +63,13 @@ class TrainingGUI:
         self.is_training = False
         self.update_queue = queue.Queue()
         self.stop_event = mp.Event()
-        self.game_history = []
+        self.game_history = deque(maxlen=MAX_REPLAY_GAMES)
         self.current_history_index = -1
         self.current_game_moves = []
+        self._replay_game = None     # 回放增量缓存：当前 GoGame 实例
+        self._replay_step = 0        # 缓存已显示到的步数
+        self._piece_items = []       # 棋盘格 → canvas item id（增量删提子用）
+        self._highlight_id = None    # 最新一手高亮的 canvas item id
         self.current_winner = None
         self.current_step = 0
 
@@ -93,6 +119,9 @@ class TrainingGUI:
         ttk.Label(frame, text="设备:").grid(row=1, column=0, sticky=tk.W)
         self.device_var = tk.StringVar(value="cuda")
         ttk.Combobox(frame, textvariable=self.device_var, values=["cuda", "cpu"], state="readonly").grid(row=1, column=1, sticky=tk.W, padx=5)
+        self.reset_bn_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="加载时重置BN（weight=1, bias=0）",
+                        variable=self.reset_bn_var).grid(row=2, column=1, sticky=tk.W, padx=5)
 
     def _create_mcts_settings(self, parent):
         frame = ttk.LabelFrame(parent, text="MCTS设置", padding="10")
@@ -172,6 +201,9 @@ class TrainingGUI:
         frame.pack(fill=tk.X, pady=(0, 10))
         self.load_data_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="加载已有数据", variable=self.load_data_var).pack(anchor=tk.W)
+        self.save_data_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="保存对局数据（不勾选=仅入内存队列，最多50000条滚动丢弃）",
+                        variable=self.save_data_var).pack(anchor=tk.W)
         self.data_dir_var = tk.StringVar(value=DATA_DIR)
         ttk.Entry(frame, textvariable=self.data_dir_var, width=25).pack(fill=tk.X, pady=2)
 
@@ -243,35 +275,67 @@ class TrainingGUI:
         self.game_board.draw_grid()
         self.game_board.draw_stars()
 
-    def _draw_board_from_moves(self, moves, step):
+    def _render_replay(self, moves, step):
+        """从头重放 moves 到第 step 步并全量绘制（切换对局/回退步数时用）。"""
         import game
         # 临时解除 Pass 限制（回放时允许任意步 Pass）
         old_min = game.MIN_MOVES_BEFORE_PASS
         game.MIN_MOVES_BEFORE_PASS = 0
         try:
             temp_game = game.GoGame()
-            # 按顺序落子到 step 步
             for i in range(step):
-                  r, c, _ = moves[i]
-                  if (r, c) == (-1, -1):
-                        temp_game.make_move(-1, -1)
-                  else:
-                        temp_game.make_move(r, c)
-                        # 绘制最终棋盘
-                  self._draw_empty_board()
-                  for r in range(self.board_size):
-                        for c in range(self.board_size):
-                              p = temp_game.board[r, c]
-                              if p:
-                                    self.game_board.draw_piece(r, c, p)
-                  if step > 0:
-                        last_r, last_c, _ = moves[step - 1]
-                        if last_r != -1:
-                              self.game_board.highlight_move(last_r, last_c)
-                  self.step_label.config(text=f"步数: {step}/{len(moves)}")
+                r, c = moves[i]
+                temp_game.make_move(r, c)
+            self._replay_game = temp_game
+            self._replay_step = step
+            self._render_all(temp_game, moves, step)
         finally:
-            # 恢复原限制
             game.MIN_MOVES_BEFORE_PASS = old_min
+
+    def _render_all(self, temp_game, moves, step):
+        """画一次完整棋盘：清空 → 网格/星位 → 全部棋子 → 高亮最新一手。
+        修复原实现：绘制原在落子循环内，显示第 N 步要重绘 N 次全棋盘（O(N×361)）。"""
+        self._draw_empty_board()
+        n = self.board_size
+        self._piece_items = [[None] * n for _ in range(n)]
+        board = temp_game.board
+        for r in range(n):
+            for c in range(n):
+                p = board[r, c]
+                if p:
+                    self._piece_items[r][c] = self.game_board.draw_piece(r, c, p)
+        self._set_highlight(moves, step)
+        self.step_label.config(text=f"步数: {step}/{len(moves)}")
+
+    def _set_highlight(self, moves, step):
+        if self._highlight_id is not None:
+            self.canvas.delete(self._highlight_id)
+            self._highlight_id = None
+        if step > 0:
+            last_r, last_c = moves[step - 1]
+            if last_r != -1:
+                self._highlight_id = self.game_board.highlight_move(last_r, last_c)
+
+    def _render_incremental(self, moves, step):
+        """增量落第 step 手：复用 _replay_game（已显示 step-1 步），只画新子、
+        删被提子、移动高亮（连点"下一步"从 O(步数) 降到 O(提子数)）。"""
+        game = self._replay_game
+        old = game.board.copy()
+        r, c = moves[step - 1]
+        game.make_move(r, c)
+        new = game.board
+        if (r, c) != (-1, -1):
+            for rr in range(self.board_size):
+                for cc in range(self.board_size):
+                    if old[rr, cc] and not new[rr, cc]:
+                        it = self._piece_items[rr][cc]
+                        if it is not None:
+                            self.canvas.delete(it)
+                            self._piece_items[rr][cc] = None
+            self._piece_items[r][c] = self.game_board.draw_piece(r, c, new[r, c])
+        self._set_highlight(moves, step)
+        self._replay_step = step
+        self.step_label.config(text=f"步数: {step}/{len(moves)}")
 
     def _display_game(self, game_result):
         if game_result is None:
@@ -279,10 +343,10 @@ class TrainingGUI:
             self.game_info_label.config(text="")
             self.step_label.config(text="步数: 0/0")
             return
-        self.current_game_moves = game_result.moves
+        self.current_game_moves = game_result.get_moves()   # 解码（仅保留当前局，切换即释放）
         self.current_winner = game_result.winner
         self.current_step = len(self.current_game_moves)
-        self._draw_board_from_moves(self.current_game_moves, self.current_step)
+        self._render_replay(self.current_game_moves, self.current_step)
         winner_text = "黑胜" if self.current_winner == 1 else "白胜" if self.current_winner == -1 else "平局"
         self.game_info_label.config(
             text=f"游戏 #{game_result.game_id} | 结果: {winner_text} | 手数: {len(self.current_game_moves)}"
@@ -298,20 +362,26 @@ class TrainingGUI:
         if self.game_history and self.current_history_index < len(self.game_history) - 1:
             self.current_history_index += 1
             self._display_game(self.game_history[self.current_history_index])
+
     def _first_step(self):
         if self.current_game_moves:
             self.current_step = 1
-            self._draw_board_from_moves(self.current_game_moves, self.current_step)
+            self._render_replay(self.current_game_moves, self.current_step)
 
     def _prev_step(self):
         if self.current_game_moves and self.current_step > 0:
             self.current_step -= 1
-            self._draw_board_from_moves(self.current_game_moves, self.current_step)
+            self._render_replay(self.current_game_moves, self.current_step)
 
     def _next_step(self):
         if self.current_game_moves and self.current_step < len(self.current_game_moves):
             self.current_step += 1
-            self._draw_board_from_moves(self.current_game_moves, self.current_step)
+            # 连续向前步进：缓存可用时增量绘制（O(1) 落子 + 提子数级 canvas 操作）
+            if (self._replay_game is not None
+                    and self._replay_step == self.current_step - 1):
+                self._render_incremental(self.current_game_moves, self.current_step)
+            else:
+                self._render_replay(self.current_game_moves, self.current_step)
 
     # ---------- 按钮回调 ----------
     def _browse_model(self):
@@ -363,7 +433,8 @@ class TrainingGUI:
                 weight_decay=self.wd_var.get(),
                 optimizer_name=self.optimizer_name_var.get(),
                 momentum=self.momentum_var.get(),
-                freeze_parts=freeze_spec or None
+                freeze_parts=freeze_spec or None,
+                reset_bn=self.reset_bn_var.get()
             )
         except Exception as e:
             self._log_message('[错误] 创建训练器失败（检查冻结参数格式）: %s' % e)
@@ -374,8 +445,9 @@ class TrainingGUI:
         if not os.path.exists(ONNX_PATH):
             self.trainer.model.export_onnx(ONNX_PATH)
 
-        self.game_history = []
+        self.game_history = deque(maxlen=MAX_REPLAY_GAMES)
         self.current_history_index = -1
+        self._replay_game = None
         self.status_text.delete(1.0, tk.END)
         self._log_message("=" * 60)
         self._log_message(f"训练开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -404,7 +476,9 @@ class TrainingGUI:
                 'exploration_mode': self.exploration_var.get(),
                 'alpha': self.alpha_var.get()
             }
-            result_queue = mp.Queue()
+            # 有界队列（背压）：worker 产数据快于主进程消费（写pkl+训练+GUI）时，
+            # put 阻塞限速，防止无限队列 pickle 堆积 → _ForkingPickler.dumps MemoryError
+            result_queue = mp.Queue(maxsize=2)
             self.training_processes = []
             for _ in range(self.threads_var.get()):
                 p = mp.Process(
@@ -492,10 +566,17 @@ class TrainingGUI:
                 self.trainer.data_buffer.add_game(
                     states, policies, players, winner, score_diff, ownership)
                 self.trainer.game_count += 1
-                self.trainer.save_training_data(
-                    (states, policies, players, winner, score_diff, ownership))
-                loss = self.trainer.train_step(batch_size)
-                if loss[0] is not None:
+                # 是否落盘：勾选才写 data/*.pkl；不勾选只进内存队列（deque(maxlen=50000) 滚动丢弃）
+                if self.save_data_var.get():
+                    self.trainer.save_training_data(
+                        (states, policies, players, winner, score_diff, ownership))
+                # 每局训练 TRAIN_STEPS_PER_GAME 个 batch（训练量不足是模型弱的常见主因；
+                # 每步从数据缓冲随机采样，步数越多利用效率越高，默认4步/局）
+                loss = (None, None, None, None, None)
+                for _ in range(TRAIN_STEPS_PER_GAME):
+                    loss = self.trainer.train_step(batch_size)
+                    if loss[0] is None:
+                        break
                     self.trainer.train_count += 1
 
                 game_result = GameResult(games, moves, winner)
@@ -511,8 +592,17 @@ class TrainingGUI:
                     self.trainer.save_model()
                     self.update_queue.put({'type': 'log', 'message': f"[模型] 已保存 (游戏 {games})"})
             self.stop_event.set()
+            # 排空队列：让卡在 put 阻塞的 worker 恢复并自然退出（put 后检查 stop_event）
+            while True:
+                try:
+                    result_queue.get_nowait()
+                except Exception:
+                    break
             for p in self.training_processes:
                 p.join(timeout=2)
+                if p.is_alive():          # 仍卡住（如 TRT 崩溃/put 死锁）→ 强制终止
+                    p.terminate()
+                    p.join(timeout=2)
             self.trainer.save_model()
             self.update_queue.put({'type': 'finished'})
         except Exception as e:
@@ -663,6 +753,10 @@ class TrainingGUI:
                 if msg['type'] == 'game':
                         game_result = msg['game_result']
                         self.game_history.append(game_result)
+                        # deque 满时头部被挤出，正在浏览的索引前移，保持指向同一局
+                        if len(self.game_history) == self.game_history.maxlen \
+                                and self.current_history_index > 0:
+                              self.current_history_index -= 1
                         if msg['loss'][0] is not None:
                               self.stats_panel.update_loss(*msg['loss'])
                         sd = msg.get('score_diff')

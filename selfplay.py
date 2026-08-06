@@ -29,7 +29,7 @@ def worker_process(trainer_params, model_path, result_queue, stop_event, device=
     复用一个 MCTS（含 TRT 会话+引擎缓存）：每局仅重置搜索树；
     主进程保存新模型（model.onnx 变更）后重建会话，保证始终用最新模型下棋。
     """
-    faulthandler.enable()   # 原生崩溃（TRT/ORT/numba）时打印 Python 栈到 stderr，便于定位
+    faulthandler.enable() 
     onnx_path = ONNX_PATH
     if not os.path.exists(onnx_path):
         print(f"[Worker] ONNX文件不存在: {onnx_path}")
@@ -67,6 +67,8 @@ def worker_process(trainer_params, model_path, result_queue, stop_event, device=
             onnx_path=onnx_path,
             mcts=mcts
         )
+        if stop_event.is_set():        # put 前检查：尽快响应停止，避免无谓入队
+            break
         result_queue.put((states, policies, players, moves, winner, score_diff, ownership))
         # Eval 已独立到 eval.py（独立进程）：worker 只做自对弈，不再内嵌评估，
         # 避免评估阻塞训练 / 卡死拖垮 worker。Eval 数据由 eval.py 存数据目录供训练使用。
@@ -182,4 +184,10 @@ def play_one_game(board_size=BOARD_SIZE, num_simulations=NUM_SIMULATIONS,
 
     # 终局：安全点捕获法判定死子 → 更新 final_points/winner，返回绝对归属图（整局共享标签）
     ownership = game.terminal_analysis()
-    return states, policies, players, moves, game.winner, game.final_points, ownership
+    # 单块 numpy 传输：list of ~300 个独立小数组 pickle 慢、临时内存大（队列传输峰值内存
+    # 可达数倍）；压成 (T,6,19,19)/(T,362) 单块后，pickle 走 numpy buffer 引用，
+    # 队列传输内存与耗时降一个量级（消费端 zip/索引兼容单块，向后兼容旧 pkl）。
+    # 磁盘/传输再减半：states/policies 转 float16（通道0-2、4-5为0/1与整数气数，float16 无损；
+    # 通道3为常量 komi 标量、策略为概率，float16 精度损失可忽略）。训练 sample() 时转回 float32。
+    return (np.stack(states).astype(np.float16), np.stack(policies).astype(np.float16),
+            players, moves, game.winner, game.final_points, ownership)

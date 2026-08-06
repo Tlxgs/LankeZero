@@ -2,7 +2,6 @@
 GUI工具模块 - 提供通用的UI组件和绘制函数
 """
 import tkinter as tk
-from tkinter import ttk
 import numpy as np
 
 
@@ -40,18 +39,18 @@ class GameBoard:
 
     def draw_piece(self, row, col, piece):
         if piece == 0:
-            return
+            return None
         x = self.margin + col * self.cell_size
         y = self.margin + row * self.cell_size
         radius = self.cell_size // 2 - 2
         color = 'black' if piece == 1 else 'white'
-        self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
-                                fill=color, outline='gray')
+        return self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                                       fill=color, outline='gray')
 
     def highlight_move(self, row, col):
         x = self.margin + col * self.cell_size
         y = self.margin + row * self.cell_size
-        self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill='red', outline='red')
+        return self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill='red', outline='red')
 
     def draw_stat_circle(self, row, col, value, max_value, text):
         x = self.margin + col * self.cell_size

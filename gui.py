@@ -5,31 +5,22 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import numpy as np
 import ctypes
-ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 让Tkinter使用DirectX渲染
+ctypes.windll.shcore.SetProcessDpiAwareness(1)
 from game import GoGame, PASS_MOVE
 from mcts import MCTS
 from ui_utils import GameBoard
 
-# 原生层崩溃（CUDA/TRT/numba 段错误、OOM 被系统杀）会跳过 Python 异常处理，
-# faulthandler 把崩溃线程的堆栈 dump 到文件，便于定位（Windows 下可捕获访问违规）
 try:
     faulthandler.enable(open('gui_crash_native.log', 'a', buffering=1))
 except Exception:
     pass
 
-# ==================== 超参数（统一配置见 hyperparams.py） ====================
 from hyperparams import (BOARD_SIZE, ONNX_PATH, KOMI, MCTS_CAP, GUI_PROVIDER,
                          GUI_MAX_SIMS, GUI_NUM_SIMULATIONS as NUM_SIMULATIONS,
                          GUI_C_PUCT as C_PUCT, GUI_TEMPERATURE as TEMPERATURE,
                          GUI_BATCH as BATCH, GUI_STEP_MS as STEP_MS,
                          GUI_DEBUG as DEBUG, GUI_CRASH_LOG as CRASH_LOG)
-# GUI搜索树容量与训练解耦：按"最多支持 GUI_MAX_SIMS 次模拟不重建"自动计算。
-# 19路开局每次展开最多 n² 个子节点：10000×361×1.2≈433万节点（内存约250MB，仅GUI进程承担）。
-# 训练保持 MCTS_CAP=80万（≤1000模拟/步≈43万节点，2倍余量），互不影响。
 GUI_CAP = max(MCTS_CAP, int(GUI_MAX_SIMS * BOARD_SIZE * BOARD_SIZE * 1.2))
-# ===============================================
-
-
 class GomokuGUI:
     def __init__(self, device='cuda'):
         self.board_size = BOARD_SIZE
@@ -78,7 +69,7 @@ class GomokuGUI:
             ("模拟次数:", self.sim_var, 10, 500, 1),
             ("c_puct:", self.cpuct_var, 0.0, 10.0, 0.1),
             ("温度:", self.temp_var, 0.0, 2.0, 0.1),
-            ("α混合:", self.alpha_var, 0.0, 1.0, 0.05),
+            ("α:", self.alpha_var, 0.0, 1.0, 0.05),
         ]
 
         for i, (txt, var, lo, hi, inc) in enumerate(params):
