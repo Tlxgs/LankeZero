@@ -5,12 +5,10 @@ import numpy as np
 from copy import deepcopy
 import math
 from numba import njit
-# ==================== 超参数（统一配置见 hyperparams.py） ====================
 from hyperparams import (BOARD_SIZE, KOMI, MAX_MOVES, PASS_MOVE,
                          MIN_MOVES_BEFORE_PASS, SCALE, PASS_LIMIT,
                          SAFE_CAPTURE_PASSES)
-# 注意：MAX_MOVES / PASS_LIMIT / SAFE_CAPTURE_PASSES 被下方 @njit(cache=True)
-# 函数作为编译期常量捕获，改 hyperparams.py 后若不生效需删除 __pycache__/ 下 .nbc 缓存
+
 try:
     from numba import njit
     _HAS_NUMBA = True

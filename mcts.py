@@ -767,9 +767,10 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                         # 胜率logit 与归属头目差（含贴目，平局=0）线性混合；混合值进 vsum，
                         # 由 _select_child 的 Q min-max 归一化（KataGo式）适配尺度后用于选择。
                         # α=0 → 纯胜率logit；α=1 → 纯目差（归属头求和 + komi，当前玩家视角）。
-                        # 注意：归属头求和=当前玩家无贴目目差，含贴目目差 = 其 + KOMI·player
-                        # （黑 +KOMI，白 -KOMI）；与上方终局 term_score 同基准。
-                        score = value + KOMI * gc.current_player
+                        # 注意：归属头求和=当前玩家无贴目目差，含贴目目差 = 其 - KOMI·player
+                        # （黑 -KOMI，白 +KOMI：KOMI 是给白方的补偿，当前玩家视角黑扣白加）；
+                        # 与上方终局 term_score（final_points·current_player）同基准。
+                        score = value - KOMI * gc.current_player
                         value = (1.0 - self.alpha) * wls[i] + self.alpha * score
                     _backup_np(
                         gc.board, gc._st, gc._go, gc._fp, gc._cap,

@@ -201,6 +201,14 @@ class TrainingGUI:
         frame.pack(fill=tk.X, pady=(0, 10))
         self.load_data_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="加载已有数据", variable=self.load_data_var).pack(anchor=tk.W)
+        mode_row = ttk.Frame(frame)
+        mode_row.pack(anchor=tk.W, pady=(0, 2))
+        ttk.Label(mode_row, text="加载方式:").pack(side=tk.LEFT)
+        self.load_mode_var = tk.StringVar(value='newest')
+        ttk.Radiobutton(mode_row, text="最新（时间倒序，填满缓冲区）", value='newest',
+                        variable=self.load_mode_var).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(mode_row, text="随机（目录随机抽取，填满缓冲区）", value='random',
+                        variable=self.load_mode_var).pack(side=tk.LEFT, padx=4)
         self.save_data_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="保存对局数据（不勾选=仅入内存队列，最多50000条滚动丢弃）",
                         variable=self.save_data_var).pack(anchor=tk.W)
@@ -463,7 +471,7 @@ class TrainingGUI:
                 args=(self.batch_size_var.get(),
                       self.ui_update_interval_var.get(),
                       self.save_interval_batch_var.get(),
-                      self.load_data_var.get()),
+                      self.load_data_var.get(), self.load_mode_var.get()),
                 daemon=True
             )
             thread.start()
@@ -491,18 +499,20 @@ class TrainingGUI:
                 target=self._training_loop,
                 args=(result_queue, self.total_var.get(), self.batch_size_var.get(),
                       self.save_interval_var.get(), self.load_data_var.get(),
+                      self.load_mode_var.get(),
                       (params, self.model_path_var.get(), self.device_var.get())),
                 daemon=True
             )
             thread.start()
 
-    def _train_only_loop(self, batch_size, update_interval, save_interval, load_data):
+    def _train_only_loop(self, batch_size, update_interval, save_interval, load_data,
+                         load_mode='newest'):
         """仅训练模式：无限循环，只用 Batch 作单位。
         每 update_interval 个 Batch 向界面推送一次损失均值（显示该区间均值）；
         每 save_interval 个 Batch 保存一次模型；停止时补存一次并收尾。"""
         try:
             if load_data:
-                self.trainer.load_training_data()
+                self.trainer.load_training_data(mode=load_mode)
             if len(self.trainer.data_buffer) < batch_size:
                 self._log_message(f"[错误] 数据不足 ({len(self.trainer.data_buffer)} < {batch_size})")
                 self.update_queue.put({'type': 'finished'})
@@ -529,6 +539,7 @@ class TrainingGUI:
                     self.trainer.save_model()
                     self.update_queue.put({'type': 'log',
                                            'message': f"[模型] 已保存 (Batch {batch_count})"})
+            self.trainer.flush_grad_accum()   # 结算梯度累积剩余周期（不满一个周期也 step 一次）
             if batch_count % save_interval != 0:
                 self.trainer.save_model()   # 停止时补存一次
             self.update_queue.put({'type': 'finished', 'batches': batch_count})
@@ -536,10 +547,10 @@ class TrainingGUI:
             self.update_queue.put({'type': 'error', 'message': str(e)})
 
     def _training_loop(self, result_queue, total_games, batch_size, save_interval, load_data,
-                       worker_args=None):
+                       load_mode='newest', worker_args=None):
         try:
             if load_data:
-                self.trainer.load_training_data()
+                self.trainer.load_training_data(mode=load_mode)
             games = 0
             while games < total_games and self.is_training:
                 # worker看门狗：进程意外退出（显存不足/TRT原生崩溃等）→自动重启，训练不终止
@@ -603,6 +614,7 @@ class TrainingGUI:
                 if p.is_alive():          # 仍卡住（如 TRT 崩溃/put 死锁）→ 强制终止
                     p.terminate()
                     p.join(timeout=2)
+            self.trainer.flush_grad_accum()   # 结算梯度累积剩余周期（不满一个周期也 step 一次）
             self.trainer.save_model()
             self.update_queue.put({'type': 'finished'})
         except Exception as e:

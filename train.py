@@ -22,7 +22,7 @@ from model import PolicyValueNet
 
 # ==================== 超参数（统一配置见 hyperparams.py） ====================
 from hyperparams import (BOARD_SIZE, NUM_SIMULATIONS, C_PUCT,
-                         BATCH_SIZE, LEARNING_RATE,
+                         BATCH_SIZE, GRAD_ACCUM_STEPS, LEARNING_RATE,
                          WEIGHT_DECAY, MOMENTUM, OPTIMIZER_NAME, WARMUP_STEPS,
                          ENTROPY_WEIGHT, OWN_WEIGHT, WIN_WEIGHT, GRAD_CLIP_NORM,
                          DATA_DIR, MODEL_PATH, ONNX_PATH,
@@ -100,11 +100,17 @@ class TrainingData:
         with open(filepath, 'wb') as f:
             pickle.dump(info, f)
 
-    def load_all(self):
+    def load_all(self, mode='newest'):
+        """批量加载 data/*.pkl 直到填满缓冲区（TRAINING_DATA_MAX）。
+        mode='newest'：按文件修改时间倒序取最新（默认，原逻辑）；
+        mode='random'：data 目录下随机抽取（洗牌后顺序加载）。"""
         files = glob.glob(os.path.join(self.data_dir, "data_*.pkl"))
         if not files:
             return False
-        files.sort(key=os.path.getmtime, reverse=True)
+        if mode == 'random':
+            random.shuffle(files)
+        else:
+            files.sort(key=os.path.getmtime, reverse=True)
         all_data = []
         for f in files:
             try:
@@ -129,7 +135,7 @@ class TrainingData:
         self.data.clear()
         for item in all_data[:self.max_size]:
             self.data.append(item)
-        print(f"[数据] 加载了 {len(self.data)} 条数据")
+        print(f"[数据] 加载了 {len(self.data)} 条数据（模式: {mode}）")
         return True
 
     def load_single(self, filename):
@@ -186,6 +192,9 @@ class SelfPlayTrainer:
         self.game_count = 0
         self.train_count = 0
         self.warmup_steps = WARMUP_STEPS   # 学习率warmup步数（前N步从0线性升至目标lr，SGD/Adam均生效）
+        self.grad_accum_steps = GRAD_ACCUM_STEPS  # 梯度累积：每 N 个 micro-batch 才做一次 optimizer.step()
+        self._accum_steps_done = 0                # 当前累积周期内已完成反向的 micro-batch 数
+        self._opt_steps = 0                       # 实际 optimizer.step() 次数（warmup 调度基准）
         
 
     def _build_optimizer(self):
@@ -334,19 +343,42 @@ class SelfPlayTrainer:
         total_loss = (policy_loss - entropy_weight * entropy
                       + own_weight * own_loss + WIN_WEIGHT * win_loss)
 
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
-        self.optimizer.step()
-        # 学习率warmup：前warmup_steps步从0线性升至目标lr（train_count由主线程自增）
-        if self.warmup_steps > 0 and self.train_count < self.warmup_steps:
-            scale = (self.train_count + 1) / self.warmup_steps
-            for g in self.optimizer.param_groups:
-                g['lr'] = self.learning_rate * scale
+        # ---- 梯度累积 ----
+        # 每 grad_accum_steps 个 micro-batch 才做一次 optimizer.step()；
+        # loss 除以累积步数再反向 → 累积梯度≈平均梯度（等效 batch = grad_accum_steps × batch_size）。
+        # BN 的 running stats 按 micro-batch 正常更新，与常规训练一致。
+        if self._accum_steps_done == 0:
+            self.optimizer.zero_grad()
+        (total_loss / self.grad_accum_steps).backward()
+        self._accum_steps_done += 1
+        if self._accum_steps_done >= self.grad_accum_steps:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
+            self.optimizer.step()
+            self._accum_steps_done = 0
+            self._opt_steps += 1
+            self._apply_warmup()
         # 释放 torch 缓存分配器持有的空闲显存给驱动（worker 的 TRT 引擎构建/加载需要显存）
         torch.cuda.empty_cache()
         return (policy_loss.item(), own_loss.item(), entropy.item(),
                 win_loss.item(), total_loss.item())
+
+    def _apply_warmup(self):
+        """学习率 warmup：按实际 optimizer.step() 次数从 0 线性升至目标 lr
+        （梯度累积下以真实步数为准；accum=1 时与原先按 train_count 调度等价）。"""
+        if self.warmup_steps > 0 and self._opt_steps <= self.warmup_steps:
+            scale = self._opt_steps / self.warmup_steps
+            for g in self.optimizer.param_groups:
+                g['lr'] = self.learning_rate * scale
+
+    def flush_grad_accum(self):
+        """梯度累积收尾：累积周期不满（余下 < grad_accum_steps 个 micro-batch）时
+        把已累积的梯度也执行一次 step，避免训练末尾/重建优化器时丢失梯度更新。"""
+        if getattr(self, '_accum_steps_done', 0) > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
+            self.optimizer.step()
+            self._accum_steps_done = 0
+            self._opt_steps += 1
+            self._apply_warmup()
 
     def save_model(self):
         # 原子保存：先写 .tmp 再 os.replace，避免 worker 评估/推理线程读到半截文件
@@ -360,11 +392,11 @@ class SelfPlayTrainer:
         # 保存后 worker 会立即用新 onnx 重建 TRT 引擎：先把 torch 空闲显存还给驱动
         torch.cuda.empty_cache()
 
-    def load_training_data(self, filename=None):
+    def load_training_data(self, filename=None, mode='newest'):
         if filename is not None:
             return self.data_buffer.load_single(filename)
         else:
-            return self.data_buffer.load_all()
+            return self.data_buffer.load_all(mode=mode)
 
     def save_training_data(self, game_data):
         self.data_buffer.save_game(game_data)
@@ -387,6 +419,7 @@ class SelfPlayTrainer:
             self.momentum = kwargs['momentum']
             rebuild = True
         if rebuild:  # 切换优化器/动量 → 重建（保留当前lr/wd）
+            self.flush_grad_accum()   # 先结算未完成的累积梯度（否则换优化器后梯度丢失）
             self.optimizer = self._build_optimizer()
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=lambda epoch: 1.0)

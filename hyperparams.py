@@ -27,7 +27,7 @@ SAFE_CAPTURE_PASSES = 3            # 安全点迭代轮数上限（判死/判活
 
 # ---------------- 自对弈（训练） ----------------
 NUM_SIMULATIONS = 300              # 每步 MCTS 模拟数
-C_PUCT = 4.0                       # MCTS 探索常数
+C_PUCT = 5.0                       # MCTS 探索常数
 TEMPERATURE = 1.0                  # 训练开局温度（GUI 滑块默认值）
 TEMPERATURE_DECAY = 0.995           # 温度指数衰减系数
 TEMPERATURE_ZERO_AFTER = 80        # 训练温度调度
@@ -35,10 +35,10 @@ TOP_P = 0.9                        # 依概率采样时保留的累计概率
 EXPLORATION_MODE = False           # 是否随机开局（四角探索）
 
 # ---------------- MCTS 搜索 ----------------
-DIRICHLET_ALPHA = 0.2              # 根节点 Dirichlet 噪声浓度
-DIRICHLET_EPSILON = 0.10           # 根节点噪声混合比例
-VIRTUAL_LOSS = 3                   # 虚拟损失（并行搜索去重）
-BATCH_SIZE_MCTS = 8                # 推理 batch（减半：4GB 显存与 torch 训练共享）
+DIRICHLET_ALPHA = 0.15             # 根节点 Dirichlet 噪声浓度
+DIRICHLET_EPSILON = 0.2           # 根节点噪声混合比例
+VIRTUAL_LOSS = 5                   # 虚拟损失（并行搜索去重）
+BATCH_SIZE_MCTS = 18                # 推理 batch（减半：4GB 显存与 torch 训练共享）
 MCTS_CAP = 600000                  # 搜索树节点容量上限（训练默认；GUI 按 GUI_MAX_SIMS 另算更大）
 
 # ---------------- 神经网络 ----------------
@@ -50,7 +50,9 @@ DROPOUT_RATE = 0.05                 # 残差块 dropout
 
 # ---------------- 训练 ----------------
 BATCH_SIZE = 256                   # 训练批大小
-LEARNING_RATE = 0.0005             # 学习率（GUI 当前默认，训练入口以此为准）
+GRAD_ACCUM_STEPS = 4                # 梯度累积步数：每 N 个 micro-batch 才执行一次 optimizer.step()
+                                    # loss 除以 N 再反向 → 等效 batch = N×BATCH_SIZE；1=关闭（原行为）
+LEARNING_RATE = 0.0001             # 学习率（GUI 当前默认，训练入口以此为准）
 WEIGHT_DECAY = 0.0001              # 权重衰减
 MOMENTUM = 0.90                    # SGD 动量（GUI 当前默认）
 OPTIMIZER_NAME = 'SGD'             # Adam / SGD（GUI 当前默认）
@@ -60,7 +62,7 @@ OWN_WEIGHT = 1.0                   # 领地头损失权重
 WIN_WEIGHT = 1.0                   # 胜率头损失权重（tanh(win_logit) → 当前玩家胜负 ±1）
 ALPHA = 0.01                       # MCTS价值线性混合因子：value = (1-α)·胜率logit + α·(归属头目差+贴目)；0=纯胜率，1=纯目差
 GRAD_CLIP_NORM = 1.0               # 梯度裁剪范数
-SAVE_INTERVAL = 10                 # 保存模型间隔（局数，自对弈模式）
+SAVE_INTERVAL = 20                 # 保存模型间隔（局数，自对弈模式）
 UI_UPDATE_BATCHES = 10             # 仅训练模式：每 N 个 Batch 更新一次界面（显示 N 个 Batch 损失均值）
 SAVE_INTERVAL_BATCHES = 100        # 仅训练模式：每 N 个 Batch 保存一次模型
 TRAIN_GAMES = 1000                 # GUI 默认训练局数（自对弈模式）
@@ -75,28 +77,28 @@ EVAL_TEMPERATURE = 0.3             # 评估温度（近贪心，减小胜负噪�
 EVAL_WIN_RATE = 0.6                # 更新最佳模型的胜率门槛
 
 # ---------------- 文件路径 / 目录 ----------------
-MODEL_PATH = 'model.pt'            # 当前模型 .pt
-ONNX_PATH = 'model.onnx'           # 当前模型 .onnx
+MODEL_PATH = 'model.pt'                      # 当前模型 .pt
+ONNX_PATH = 'model.onnx'                     # 当前模型 .onnx
 BEST_MODEL_PATH = 'model_best.pt'  # 最佳模型 .pt
 DATA_DIR = 'data/'                 # 训练/评估对局数据目录（GUI 与 eval 一致）
 EVAL_WORK_DIR = 'eval_work'        # 评估引擎/快照工作目录（独立 trt_cache，与训练隔离）
 SNAPSHOT_ONNX = 'eval_current.onnx'  # 评估期间冻结的"当前模型"快照名
 
 # ---------------- GUI（人对弈 gui.py） ----------------
-GUI_PROVIDER = 'cuda'              # GUI 推理执行器：cuda=稳健默认 / trt=最快 / cpu
+GUI_PROVIDER = 'cuda'               # GUI 推理执行器：cuda=稳健默认 / trt=最快（TRT优先，失败自动降级cuda）/ cpu
 GUI_MAX_SIMS = 10000               # GUI 最多支持模拟数（用于计算搜索树容量）
 GUI_NUM_SIMULATIONS = 400          # GUI 默认模拟数（人对弈交互，保持原值）
-GUI_C_PUCT = 4.0                   # GUI 探索常数
+GUI_C_PUCT = 5.0                   # GUI 探索常数
 GUI_TEMPERATURE = 0.0              # GUI 落子温度（人对弈，固定贪心）
-GUI_BATCH = 16                     # GUI 推理 batch
-GUI_STEP_MS = 10                   # GUI 搜索步进间隔（ms）
+GUI_BATCH = 32                     # GUI 推理 batch
+GUI_STEP_MS = 15                   # GUI 搜索步进间隔（ms）
 GUI_DEBUG = True                   # GUI 调试输出开关
 GUI_CRASH_LOG = 'gui_crash.log'    # GUI 异常日志（诊断闪退用）
 
 # ---------------- 推理 / 运行时 ----------------
 OMP_NUM_THREADS = 8                # OpenMP 线程数（mcts 启动时写入环境变量）
-TRT_WORKSPACE = 1 << 28            # 256MB：TRT 构建期峰值显存减半（4GB 显存与训练共享）
-TRT_OPT_LEVEL = 5                  # TRT builder 优化级别
+TRT_WORKSPACE = 1 << 29            # 512MB：TRT 构建期峰值显存减半（4GB 显存与训练共享）
+TRT_OPT_LEVEL = 4                  # TRT builder 优化级别
 TRT_FP16 = True                    # TRT FP16 加速
 PYTORCH_CUDA_ALLOC_CONF = 'max_split_size_mb:64'  # torch 显存碎片控制（4GB 显存共享）
 

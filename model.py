@@ -260,6 +260,29 @@ class PolicyValueNet(nn.Module):
                            'win_logit': {0: 'batch'}},
             opset_version=11
         )
+        # torch.onnx.export 对部分算子（ReduceSum/Add 等）的输出轴无法静态推断，会写成
+        # dim_param（如 'ReduceSumvalue_dim_1'）——ORT/TRT 运行时可用，但 eval.py 的静态
+        # 形状校验会误判不兼容。这里把输出张量的非 batch 动态轴改写为静态值（batch 保持动态）。
+        try:
+            import onnx
+            m = onnx.load(path)
+            expect = {
+                'policy': (self.board_size * self.board_size + 1,),
+                'value': (1,),
+                'ownership': (1, self.board_size, self.board_size),
+                'win_logit': (1,),
+            }
+            for out in m.graph.output:
+                eshape = expect.get(out.name)
+                if eshape is None:
+                    continue
+                dims = out.type.tensor_type.shape.dim
+                for i, val in enumerate(eshape, start=1):
+                    if i < len(dims) and dims[i].HasField('dim_param'):
+                        dims[i].dim_value = val   # oneof：赋值自动清除 dim_param
+            onnx.save(m, path)
+        except Exception:
+            pass   # 后处理失败不阻塞导出（动态轴在 ORT 下仍可运行）
         if original_device.type != 'cpu':
             self.to(original_device)
         print(f"[ONNX] 模型已导出至 {path}")
