@@ -23,10 +23,10 @@ class ResBlock(nn.Module):
     def forward(self, x):
         res = x
         out = self.bn1(x)
-        out = F.relu(out)
+        out = F.leaky_relu(out)
         out = self.conv1(out)
         out = self.bn2(out)
-        out = F.relu(out)
+        out = F.leaky_relu(out)
         out = self.conv2(out)
         res = self.bottleneck(res)
         res = self.bn_bottle(res)
@@ -82,23 +82,23 @@ class PolicyValueNet(nn.Module):
 
     def forward(self, x):
         # 共享特征
-        out = F.relu(self.bn_input(self.conv_input(x)))
+        out = F.leaky_relu(self.bn_input(self.conv_input(x)))
         for res in self.res_blocks:
             out = res(out)
 
         # ---------- 策略头（独立 2 层 3×3 塔）----------
-        policy = F.relu(self.policy_bn(self.policy_conv(out)))                  # (B, HEAD_CHANNELS, H, W)
-        policy = F.relu(self.policy_bn2(self.policy_conv2(policy)))             # (B, HEAD_CHANNELS, H, W)
+        policy = F.leaky_relu(self.policy_bn(self.policy_conv(out)))                  # (B, HEAD_CHANNELS, H, W)
+        policy = F.leaky_relu(self.policy_bn2(self.policy_conv2(policy)))             # (B, HEAD_CHANNELS, H, W)
         policy_spatial = self.conv_policy_out(policy).view(policy.size(0), -1)  # (B, 361) 逐点 logit
         policy_pass = self.fc_policy_pass(                                      # (B, 1) pass logit（全局池化）
             F.adaptive_avg_pool2d(policy, 1).flatten(1))
         policy = torch.cat([policy_spatial, policy_pass], dim=1)                # (B, 362)
 
         # ---------- 共享头塔（归属头/胜率头共用第一层，KataGo 风格）----------
-        head = F.relu(self.head_bn(self.head_conv(out)))                        # (B, HEAD_CHANNELS, H, W)
+        head = F.leaky_relu(self.head_bn(self.head_conv(out)))                        # (B, HEAD_CHANNELS, H, W)
 
         # ---------- 领地头（价值 = 归属求和；共享塔 + 1 层加深，本地 + 全局偏置）----------
-        own = F.relu(self.own_bn(self.own_conv(head)))                          # (B, HEAD_CHANNELS, H, W)
+        own = F.leaky_relu(self.own_bn(self.own_conv(head)))                          # (B, HEAD_CHANNELS, H, W)
         own_local = self.conv_own_out(own)                                      # (B, 1, H, W) 逐点本地归属
         own_global = self.fc_own_global(                                        # (B, 1) 全局偏置（允许整体偏移）
             F.adaptive_avg_pool2d(own, 1).flatten(1))
@@ -107,8 +107,8 @@ class PolicyValueNet(nn.Module):
         value = ownership.sum(dim=(2, 3))                                       # (B, 1) 期望领地目差（当前视角）
 
         # ---------- 胜率头（共享塔 + 1 层加深；全局平均池化 → 2 层 MLP；tanh 后=当前玩家胜率 ±1，MCTS 用 logit）----------
-        win = F.relu(self.win_bn(self.win_conv(head)))                          # (B, HEAD_CHANNELS, H, W)
-        win = F.relu(self.win_fc1(F.adaptive_avg_pool2d(win, 1).flatten(1)))    # (B, HEAD_CHANNELS)
+        win = F.leaky_relu(self.win_bn(self.win_conv(head)))                          # (B, HEAD_CHANNELS, H, W)
+        win = F.leaky_relu(self.win_fc1(F.adaptive_avg_pool2d(win, 1).flatten(1)))    # (B, HEAD_CHANNELS)
         win_logit = self.win_fc2(win)                                           # (B, 1) logit
 
         return policy, value, ownership_raw, win_logit

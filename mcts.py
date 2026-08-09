@@ -21,7 +21,7 @@ def _ensure_torch():
         _torch_ready = True
     return torch, F
 
-from hyperparams import (BOARD_SIZE, C_PUCT, NUM_SIMULATIONS, TEMPERATURE, KOMI,
+from hyperparams import (BOARD_SIZE, C_PUCT, NUM_SIMULATIONS, TEMPERATURE,
                          DIRICHLET_ALPHA, DIRICHLET_EPSILON, VIRTUAL_LOSS,
                          BATCH_SIZE_MCTS, MCTS_CAP, OMP_NUM_THREADS,
                          TRT_WORKSPACE, TRT_OPT_LEVEL, TRT_FP16, ALPHA)
@@ -767,10 +767,11 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                         # 胜率logit 与归属头目差（含贴目，平局=0）线性混合；混合值进 vsum，
                         # 由 _select_child 的 Q min-max 归一化（KataGo式）适配尺度后用于选择。
                         # α=0 → 纯胜率logit；α=1 → 纯目差（归属头求和 + komi，当前玩家视角）。
-                        # 注意：归属头求和=当前玩家无贴目目差，含贴目目差 = 其 - KOMI·player
-                        # （黑 -KOMI，白 +KOMI：KOMI 是给白方的补偿，当前玩家视角黑扣白加）；
+                        # 注意：归属头求和=当前玩家无贴目目差，含贴目目差 = 其 - komi·player
+                        # （黑 -komi，白 +komi：komi 是给白方的补偿，当前玩家视角黑扣白加）；
                         # 与上方终局 term_score（final_points·current_player）同基准。
-                        score = value - KOMI * gc.current_player
+                        # 用 gc.komi（游戏实际贴目，GUI 可改）：终局/网络输入/MCTS 混合须同一基准。
+                        score = value - gc.komi * gc.current_player
                         value = (1.0 - self.alpha) * wls[i] + self.alpha * score
                     _backup_np(
                         gc.board, gc._st, gc._go, gc._fp, gc._cap,

@@ -3,7 +3,6 @@
 """
 import numpy as np
 from copy import deepcopy
-import math
 from numba import njit
 from hyperparams import (BOARD_SIZE, KOMI, MAX_MOVES, PASS_MOVE,
                          MIN_MOVES_BEFORE_PASS, SCALE, PASS_LIMIT,
@@ -323,6 +322,14 @@ def _liberty_channels(board, n, player, own_out, opp_out):
 
 @njit(cache=True)
 def _canonical_state(board, st, n, komi, player, out):
+    """当前玩家视角规范输入（训练/自对弈/MCTS/GUI 全链路共用同一编码）：
+    通道0=己方棋子、通道1=对方棋子、通道2=上一手位置、
+    通道3=贴目标量 kch = st[0]*komi/14（st[0]=当前玩家色，黑+1/白-1；
+        符号按俗称“黑贴X目”的贴目方向约定：黑行棋=+komi（黑欠白komi，黑须净胜过贴目），
+        白行棋=-komi（反向，即“白倒贴”视角，白含komi优势）；网络学到的语义
+        =当前玩家需克服的贴目，编码全链路自洽。若按“受益方”约定取反（白+黑-）亦可，
+        但改符号必须重训，勿单独改动！）
+    通道4=己方棋块危急度（1气=1.0最危急）、通道5=对方棋块危急度。"""
     kch = np.float32(st[0] * komi / 14.0)
     last_valid = st[1] >= 0
     for r in range(n):
@@ -333,95 +340,6 @@ def _canonical_state(board, st, n, komi, player, out):
             out[3, r, c] = kch
     # 通道4=己方棋块危急度（1气=1.0最危急），通道5=对方棋块危急度
     _liberty_channels(board, n, player, out[4], out[5])
-
-
-@njit(cache=True)
-def _life_death(board, g_label, n, g_color, g_adj_regions, g_adj_contact, g_adj_cnt,
-                ng, thresh, strength_eye):
-    """死活启发式：pass1潜力→眼判定→强度；pass2强度潜力→死棋判定；
-    最后加“气数硬判定”：气≤1的棋块必死（对手提子必合法：提后己方有气）。
-    返回 (alive int8[ng+1], g_eyes int32[ng+1] 每组眼区域数)。"""
-    max_r = g_adj_regions.shape[1]
-    bp = np.zeros(max_r, dtype=np.float64)
-    wp = np.zeros(max_r, dtype=np.float64)
-    strength = np.ones(ng + 1, dtype=np.float64)
-    for g in range(1, ng + 1):
-        for j in range(g_adj_cnt[g]):
-            rid = g_adj_regions[g, j]
-            pot = float(g_adj_contact[g, j])
-            if g_color[g] == 1:
-                bp[rid] += pot
-            else:
-                wp[rid] += pot
-    for g in range(1, ng + 1):
-        for j in range(g_adj_cnt[g]):
-            rid = g_adj_regions[g, j]
-            if g_color[g] == 1:
-                my = bp[rid]
-                op = wp[rid]
-            else:
-                my = wp[rid]
-                op = bp[rid]
-            if my - op >= thresh or (op == 0.0 and my > 0.0):
-                strength[g] = strength_eye
-                break
-    bp[:] = 0.0
-    wp[:] = 0.0
-    for g in range(1, ng + 1):
-        for j in range(g_adj_cnt[g]):
-            rid = g_adj_regions[g, j]
-            pot = strength[g] * float(g_adj_contact[g, j])
-            if g_color[g] == 1:
-                bp[rid] += pot
-            else:
-                wp[rid] += pot
-    alive = np.ones(ng + 1, dtype=np.int8)
-    g_eyes = np.zeros(ng + 1, dtype=np.int32)
-    for g in range(1, ng + 1):
-        eye_cnt = 0
-        for j in range(g_adj_cnt[g]):
-            rid = g_adj_regions[g, j]
-            if g_color[g] == 1:
-                my = bp[rid]
-                op = wp[rid]
-            else:
-                my = wp[rid]
-                op = bp[rid]
-            if my - op >= thresh or (op == 0.0 and my > 0.0):
-                eye_cnt += 1
-        g_eyes[g] = eye_cnt
-        if eye_cnt > 0:
-            continue
-        for j in range(g_adj_cnt[g]):
-            rid = g_adj_regions[g, j]
-            if g_color[g] == 1:
-                my = bp[rid]
-                op = wp[rid]
-            else:
-                my = wp[rid]
-                op = bp[rid]
-            if op - my >= thresh:
-                alive[g] = 0
-                break
-    # 气数硬判定：气≤1的棋块必死（1气可被直接提掉；0气不可能存在于合法盘面）。
-    # 修复“只剩一口气仍判活”——接触潜力模型无法表达“唯一气点=立即被提”。
-    g_libs = np.zeros(ng + 1, dtype=np.int32)
-    for r in range(n):
-        for c in range(n):
-            g = g_label[r, c]
-            if g > 0:
-                if r > 0 and board[r - 1, c] == 0:
-                    g_libs[g] += 1
-                if r < n - 1 and board[r + 1, c] == 0:
-                    g_libs[g] += 1
-                if c > 0 and board[r, c - 1] == 0:
-                    g_libs[g] += 1
-                if c < n - 1 and board[r, c + 1] == 0:
-                    g_libs[g] += 1
-    for g in range(1, ng + 1):
-        if g_libs[g] <= 1:
-            alive[g] = 0
-    return alive, g_eyes
 
 
 @njit(cache=True)
@@ -758,7 +676,6 @@ class GoGame:
         self._go = np.zeros(1, dtype=np.bool_)
         self._fp = np.zeros(1, dtype=np.float64)
         self._cap = np.zeros(self.board_size * self.board_size, dtype=np.int32)
-        self._terminal_cache = {}
 
     # ---- 属性（与 Python 版同名同语义）----
     @property
@@ -903,7 +820,6 @@ class GoGame:
         g._go = self._go.copy()
         g._fp = self._fp.copy()
         g._cap = np.zeros(self.board_size * self.board_size, dtype=np.int32)
-        g._terminal_cache = {}
         g._simulate_mode = False
         return g
 
@@ -1005,23 +921,6 @@ class GoGame:
             'black_stones': black_stones, 'white_stones': white_stones,
             'final_diff': (black_stones + tb) - (white_stones + tw + self.komi),
         }
-
-    def get_terminal_value(self, player):
-        if not self.game_over:
-            return None
-        board_hash = hash(self.board.tobytes())
-        cache_key = (board_hash, player)
-        if cache_key in self._terminal_cache:
-            return self._terminal_cache[cache_key]
-        # P0修复：终局回传原始目差（无界），与网络 value（ownership.sum()）同尺度。
-        # 旧版 /SCALE=10 会令搜索中终局分支的 Q 系统性偏小（官子不敏感、不主动终局）。
-        value_base = math.fabs(self.final_points)
-        if self.winner == 0:
-            value = 0.0
-        else:
-            value = value_base if self.winner == player else -value_base
-        self._terminal_cache[cache_key] = value
-        return value
 
     def __str__(self):
         symbols = {0: '.', 1: 'X', -1: 'O'}

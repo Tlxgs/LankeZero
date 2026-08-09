@@ -28,15 +28,15 @@ SAFE_CAPTURE_PASSES = 3            # 安全点迭代轮数上限（判死/判活
 # ---------------- 自对弈（训练） ----------------
 NUM_SIMULATIONS = 300              # 每步 MCTS 模拟数
 C_PUCT = 5.0                       # MCTS 探索常数
-TEMPERATURE = 1.0                  # 训练开局温度（GUI 滑块默认值）
+TEMPERATURE = 0.6                  # 训练开局温度（GUI 滑块默认值）
 TEMPERATURE_DECAY = 0.995           # 温度指数衰减系数
 TEMPERATURE_ZERO_AFTER = 80        # 训练温度调度
 TOP_P = 0.9                        # 依概率采样时保留的累计概率
 EXPLORATION_MODE = False           # 是否随机开局（四角探索）
 
 # ---------------- MCTS 搜索 ----------------
-DIRICHLET_ALPHA = 0.15             # 根节点 Dirichlet 噪声浓度
-DIRICHLET_EPSILON = 0.2           # 根节点噪声混合比例
+DIRICHLET_ALPHA = 0.12             # 根节点 Dirichlet 噪声浓度
+DIRICHLET_EPSILON = 0.12           # 根节点噪声混合比例
 VIRTUAL_LOSS = 5                   # 虚拟损失（并行搜索去重）
 BATCH_SIZE_MCTS = 18                # 推理 batch（减半：4GB 显存与 torch 训练共享）
 MCTS_CAP = 600000                  # 搜索树节点容量上限（训练默认；GUI 按 GUI_MAX_SIMS 另算更大）
@@ -49,8 +49,8 @@ NUM_RES_BLOCKS = 10                # 残差块数
 DROPOUT_RATE = 0.05                 # 残差块 dropout
 
 # ---------------- 训练 ----------------
-BATCH_SIZE = 256                   # 训练批大小
-GRAD_ACCUM_STEPS = 4                # 梯度累积步数：每 N 个 micro-batch 才执行一次 optimizer.step()
+BATCH_SIZE = 128                   # 训练批大小
+GRAD_ACCUM_STEPS = 8                # 梯度累积步数：每 N 个 micro-batch 才执行一次 optimizer.step()
                                     # loss 除以 N 再反向 → 等效 batch = N×BATCH_SIZE；1=关闭（原行为）
 LEARNING_RATE = 0.0001             # 学习率（GUI 当前默认，训练入口以此为准）
 WEIGHT_DECAY = 0.0001              # 权重衰减
@@ -60,14 +60,14 @@ WARMUP_STEPS = 20                  # 学习率 warmup 步数（前 N 步线性�
 ENTROPY_WEIGHT = 0                 # 策略熵正则权重
 OWN_WEIGHT = 1.0                   # 领地头损失权重
 WIN_WEIGHT = 1.0                   # 胜率头损失权重（tanh(win_logit) → 当前玩家胜负 ±1）
-ALPHA = 0.01                       # MCTS价值线性混合因子：value = (1-α)·胜率logit + α·(归属头目差+贴目)；0=纯胜率，1=纯目差
+ALPHA = 0.05                       # MCTS价值线性混合因子：value = (1-α)·胜率logit + α·(归属头目差+贴目)；0=纯胜率，1=纯目差
 GRAD_CLIP_NORM = 1.0               # 梯度裁剪范数
 SAVE_INTERVAL = 20                 # 保存模型间隔（局数，自对弈模式）
 UI_UPDATE_BATCHES = 10             # 仅训练模式：每 N 个 Batch 更新一次界面（显示 N 个 Batch 损失均值）
 SAVE_INTERVAL_BATCHES = 100        # 仅训练模式：每 N 个 Batch 保存一次模型
 TRAIN_GAMES = 1000                 # GUI 默认训练局数（自对弈模式）
-TRAIN_STEPS_PER_GAME = 4           # 自对弈模式每局训练步数
-TRAINING_DATA_MAX = 50000          # 训练数据缓冲上限
+TRAIN_STEPS_PER_GAME = 8           # 自对弈模式每局训练步数
+TRAINING_DATA_MAX = 60000          # 训练数据缓冲上限
 
 
 
@@ -98,7 +98,7 @@ GUI_CRASH_LOG = 'gui_crash.log'    # GUI 异常日志（诊断闪退用）
 # ---------------- 推理 / 运行时 ----------------
 OMP_NUM_THREADS = 8                # OpenMP 线程数（mcts 启动时写入环境变量）
 TRT_WORKSPACE = 1 << 29            # 512MB：TRT 构建期峰值显存减半（4GB 显存与训练共享）
-TRT_OPT_LEVEL = 4                  # TRT builder 优化级别
+TRT_OPT_LEVEL = 3                  # TRT builder 优化级别
 TRT_FP16 = True                    # TRT FP16 加速
 PYTORCH_CUDA_ALLOC_CONF = 'max_split_size_mb:64'  # torch 显存碎片控制（4GB 显存共享）
 
