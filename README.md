@@ -17,17 +17,19 @@ GUI 人机对弈。
 
 目录结构
 --------
-game.py          – 围棋逻辑（落子、提子、劫、终局判定）
-mcts.py          – MCTS搜索（numba加速，支持TensorRT/ONNX推理）
-model.py         – PyTorch神经网络定义（残差网络+三头）
-train.py         – 训练器（SelfPlayTrainer）、数据管理
-train_gui.py     – 训练GUI（启动自对弈、监控、回放）
-selfplay.py      – 自对弈生成数据（独立模块，不依赖torch）
-gui.py           – 人机对弈GUI
-eval.py          – 独立评估脚本（当前 vs 最佳）
-hyperparams.py   – 统一超参数配置（唯一修改入口）
-ui_utils.py      – GUI通用组件
-test.py          – 模型参数健康检查
+| 文件            | 说明                                           |
+|-----------------|------------------------------------------------|
+| `game.py`       | 围棋逻辑（落子、提子、劫、终局判定）           |
+| `mcts.py`       | MCTS搜索（numba加速，支持TensorRT/ONNX推理）   |
+| `model.py`      | PyTorch神经网络定义（残差网络+三头）           |
+| `train.py`      | 训练器（SelfPlayTrainer）、数据管理            |
+| `train_gui.py`  | 训练GUI（启动自对弈、监控、回放）              |
+| `selfplay.py`   | 自对弈生成数据（独立模块，不依赖torch）        |
+| `gui.py`        | 人机对弈GUI                                    |
+| `eval.py`       | 独立评估脚本（当前 vs 最佳）                   |
+| `hyperparams.py`| 统一超参数配置（唯一修改入口）                 |
+| `ui_utils.py`   | GUI通用组件                                    |
+| `test.py`       | 模型参数健康检查                               |
 
 快速开始
 --------
