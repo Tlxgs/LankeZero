@@ -205,12 +205,12 @@ class TrainingGUI:
         mode_row.pack(anchor=tk.W, pady=(0, 2))
         ttk.Label(mode_row, text="加载方式:").pack(side=tk.LEFT)
         self.load_mode_var = tk.StringVar(value='newest')
-        ttk.Radiobutton(mode_row, text="最新（时间倒序，填满缓冲区）", value='newest',
+        ttk.Radiobutton(mode_row, text="最新", value='newest',
                         variable=self.load_mode_var).pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(mode_row, text="随机（目录随机抽取，填满缓冲区）", value='random',
+        ttk.Radiobutton(mode_row, text="随机", value='random',
                         variable=self.load_mode_var).pack(side=tk.LEFT, padx=4)
         self.save_data_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="保存对局数据（不勾选=仅入内存队列，最多50000条滚动丢弃）",
+        ttk.Checkbutton(frame, text="保存对局数据",
                         variable=self.save_data_var).pack(anchor=tk.W)
         self.data_dir_var = tk.StringVar(value=DATA_DIR)
         ttk.Entry(frame, textvariable=self.data_dir_var, width=25).pack(fill=tk.X, pady=2)
