@@ -147,10 +147,11 @@ def play_one_game(board_size=BOARD_SIZE, num_simulations=NUM_SIMULATIONS,
         temp = temperature_schedule(temperature, move_count, TEMPERATURE_DECAY,
                                     temperature_zero_after)
         cur_mcts = mcts if game.current_player == 1 else (mcts_b or mcts)
-        move_probs = cur_mcts.get_move_probs(game, temp, num_simulations)
+        # 训练目标用不含温度的归一化访问计数；带温度的锐化分布只用于落子采样
+        policy_probs, sample_probs = cur_mcts.get_move_probs(game, temp, num_simulations)
         state = game.get_canonical_state()
         policy = np.zeros(board_size * board_size + 1, dtype=np.float32)
-        for move, prob in move_probs.items():
+        for move, prob in policy_probs.items():
             if move == PASS_MOVE:
                 idx = board_size * board_size
             else:
@@ -161,8 +162,8 @@ def play_one_game(board_size=BOARD_SIZE, num_simulations=NUM_SIMULATIONS,
         players.append(game.current_player)
 
 
-        if move_probs:
-            items = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
+        if sample_probs:
+            items = sorted(sample_probs.items(), key=lambda x: x[1], reverse=True)
             moves_list = [m for m, _ in items]
             probs = np.array([p for _, p in items], dtype=np.float32)
             cum_probs = np.cumsum(probs)

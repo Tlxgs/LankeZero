@@ -783,12 +783,20 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 remaining -= batch
 
         def get_move_probs(self, game, temp=None, target_visits=1):
+            """搜索后返回 (policy_probs, sample_probs)，两者语义不同、不可混用：
+
+            policy_probs —— 归一化访问计数，**训练目标**（对应 AlphaGo Zero 的 π）
+            sample_probs —— 访问计数按温度锐化后归一化，**落子用**
+
+            温度是「为了探索怎么走」的采样参数，不是「教网络什么」的监督信号，
+            共用一个出口会让探索参数改写监督目标。
+            """
             if temp is None:
                 temp = self.temperature
             if self._root is None or self._root_key != self._game_key(game):
                 self.init_root(game)   # 局面不匹配（如评估对局双模型交替）则重建树
             if self._root is None:
-                return {}
+                return {}, {}
             self._add_dirichlet_noise()   # 每次搜索前给根先验混入噪声（复用根同样生效）
             current = int(self._visits[self._root])
             remaining = max(1, target_visits - current)
@@ -796,9 +804,13 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 b = min(self.batch_size, remaining)
                 self.simulate_batch(game, b)
                 remaining -= b
-            return self._get_visit_probs(temp)[0]
+            return self._get_visit_probs(temp)
 
         def _get_visit_probs(self, temp):
+            """从根节点子树的访问计数导出 (policy_probs, sample_probs)。
+
+            sample_probs 在 temp<=0.1 时退化为 argmax 的 one-hot（贪心落子）。
+            """
             root = self._root
             n = self.board_size
             move_visits = {}
@@ -806,11 +818,13 @@ if _HAS_NUMBA and _GAME_HAS_NUMBA:
                 mv = self._cmove[s]
                 move = PASS_MOVE if mv == n * n else (mv // n, mv % n)
                 move_visits[move] = int(self._visits[self._cnode[s]])
-            if temp <= 0.1:
-                best = max(move_visits, key=move_visits.get)
-                return {best: 1.0}, best
             moves = list(move_visits.keys())
             visits = np.array([move_visits[m] for m in moves])
-            probs = visits ** (1.0 / temp)
-            probs /= probs.sum()
-            return {m: p for m, p in zip(moves, probs)}, moves[np.argmax(probs)]
+            policy_probs = visits / visits.sum()
+            policy = {m: p for m, p in zip(moves, policy_probs)}
+            if temp <= 0.1:
+                best = moves[int(np.argmax(policy_probs))]
+                return policy, {best: 1.0}
+            sample = visits ** (1.0 / temp)
+            sample /= sample.sum()
+            return policy, {m: p for m, p in zip(moves, sample)}
