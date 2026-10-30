@@ -1,0 +1,6 @@
+# 本机运行依赖（Python 3.8+；Windows 自带 tkinter）
+# torch 请按显卡/CUDA 版本安装，例如 cu124：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+numpy>=1.23,<2.0
+numba>=0.58,<0.59
+torch>=2.2

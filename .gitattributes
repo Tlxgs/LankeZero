@@ -1,0 +1,3 @@
+# Windows 批处理固定按原始字节保存（GBK + CRLF），禁止 Git 做换行/编码转换
+*.cmd -text
+*.bat -text

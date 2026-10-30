@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f3f2ee">
+  <meta name="description" content="烂柯 Zero">
+  <title>烂柯 Zero Demo</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23b9b7ae'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%23201f1c'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./web/css/style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="masthead">
+      <h1>烂柯 Zero Demo</h1>
+    </header>
+
+    <section class="controls" aria-label="对局设置">
+      <div class="control">
+        <div class="segmented" id="color" role="group" aria-label="选择执黑或执白">
+          <button type="button" data-color="1" aria-pressed="true">执黑</button>
+          <button type="button" data-color="-1" aria-pressed="false">执白</button>
+        </div>
+      </div>
+      <div class="control">
+        <div class="segmented" id="size" role="group" aria-label="选择棋盘大小">
+          <button type="button" data-size="9" aria-pressed="false">9 路</button>
+          <button type="button" data-size="13" aria-pressed="false">13 路</button>
+          <button type="button" data-size="19" aria-pressed="true">19 路</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="board-stage" aria-label="棋盘">
+      <canvas id="board" width="720" height="720" aria-label="围棋棋盘"></canvas>
+      <div class="toast" id="toast" role="status"></div>
+    </section>
+
+    <footer class="footer">
+      <div class="status" id="status" aria-live="polite">准备模型</div>
+      <div class="actions">
+        <button type="button" id="pass">停一手</button>
+        <button type="button" id="new">新局</button>
+      </div>
+  </main>
+  <noscript>这个页面需要启用 JavaScript。</noscript>
+  <script type="module" src="./web/js/app.mjs"></script>
+</body>
+</html>
