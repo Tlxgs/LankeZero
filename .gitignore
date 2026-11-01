@@ -1,4 +1,4 @@
-# 运行时/虚拟环境
+# 运行环境
 .venv/
 venv/
 __pycache__/
@@ -6,18 +6,21 @@ __pycache__/
 *.nbi
 *.nbc
 
-# 权重与训练产物（只增不改，不进 git）
-*.pt
+# 权重：仓库只跟踪 model.pt
 *.pth
 *.ckpt
+model_b6c96.pt
 *.onnx
-!web/model/model.onnx
 *.engine
 *.plan
+*.tmp
 trt_cache/
+trt_engines/
+trt_runtime/
 
-# 训练数据 / 回放 / 日志
+# 训练数据 / 日志 / 本机设置
 data*/
+Human/
 logs/
 eval_work/
 *.pkl
@@ -26,27 +29,23 @@ eval_work/
 *.log
 train_*.log
 bench_*.json
-
-# 本机 GUI 参数（关掉重开保留；不进 git）
 train_gui_settings.json
 train_gui_settings.json.tmp
 
-# 工具/下载/旧代码备份
+# 工具 / 下载 / 旧代码
 _dl/
 codebakeup/
 .vscode/
-
-# 临时测试目录
 tmp*/
-_webtest/
-_web_test*.onnx
-_tmp_export.py
+
+# 本地保留，不上传
+web/
+/index.html
+/.nojekyll
+archive/
+docs/
+/*.cmd
 
 # 系统文件
 Thumbs.db
 desktop.ini
-
-# 本次公开上传排除（本地保留）
-archive/
-docs/
-/*.cmd

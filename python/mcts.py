@@ -1,6 +1,7 @@
 """围棋 MCTS：Numba 扁平树 + 批量神经网络评估。
 
-本机单进程版本：推理器由 evaluator.GoEvaluator 提供，不再走 ONNX/TensorRT。
+本机单进程版本：推理器由 evaluator.GoEvaluator（默认）或可选的
+trt_engine.TrtEvaluator（TensorRT REFIT，自动回退）提供。
 子节点展开时按策略概率质量裁剪候选（candidate_mass + min_candidates），
 减少 19 路宽分支的树节点与选择开销；根节点裁剪时额外保留合法 pass，
 子节点不额外保留；训练目标仍来自根访问计数。
@@ -17,7 +18,8 @@ from hyperparams import (BOARD_SIZE, C_PUCT, NUM_SIMULATIONS, TEMPERATURE,
                          BATCH_SIZE_MCTS, MCTS_CAP, OMP_NUM_THREADS, ALPHA,
                          CPUCT_LOG, CPUCT_BASE, UTIL_SCORE_SCALE,
                          UTIL_STDEV_PRIOR, UTIL_STDEV_SCALE, FPU_REDUCTION,
-                         MODEL_PATH, CANDIDATE_MASS, MIN_CANDIDATES, board_rules)
+                         MODEL_PATH, CANDIDATE_MASS, MIN_CANDIDATES, board_rules,
+                         PASS_TERMINAL_LOSS)
 
 os.environ["OMP_NUM_THREADS"] = str(OMP_NUM_THREADS)
 os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
@@ -80,7 +82,7 @@ if _HAS_NUMBA:
         return best_slot
 
     @njit(cache=True)
-    def _select_np(board, st, go, fp, cap,
+    def _select_np(board, st, go, fp, cap, hist,
                    parent, cstart, ccount, cmove, cnode,
                    visits, vsum, priors, vloss, expanded,
                    root, c_puct, vl, n, path,
@@ -106,7 +108,7 @@ if _HAS_NUMBA:
             else:
                 r = move // n
                 c = move % n
-            _make_move(board, st, go, fp, r, c, cap)
+            _make_move(board, st, go, fp, r, c, cap, hist)
             vloss[child] += vl
             path[path_len] = child
             path_len += 1
@@ -380,6 +382,28 @@ if _HAS_NUMBA:
         def _utility(self, win_logit, score):
             return _utility(win_logit, score, self.alpha)
 
+        def _terminal_value(self, game):
+            """终局叶子价值（当前行棋方视角）。
+
+            PASS 终局先按“最后一手 PASS 的人”结算：胜方 +1.0，败方
+            PASS_TERMINAL_LOSS；再取反得到当前行棋方视角的叶子值。
+            这样败方 PASS 后自己的边值是 PASS_TERMINAL_LOSS，而不是 -1.0。
+            非 PASS 终局仍走原来的胜率+目差混合。
+            """
+            if game.winner is None:
+                game._compute_winner()
+            if game.winner == 0:
+                return 0.0
+            if game.last_move == PASS_MOVE:
+                # 价值按“最后一手 PASS 的人”结算，而不是按当前行棋方。
+                # 这样失败方 PASS 后自己的搜索值是 PASS_TERMINAL_LOSS，
+                # 不会出现“失败方 PASS、当前行棋方已获胜 ⇒ 失败方仍看到 -1”的错误。
+                passer = -game.current_player
+                return -1.0 if game.winner == passer else -PASS_TERMINAL_LOSS
+            term_score = game.final_points * game.current_player
+            term_wl = 6.0 if game.winner == game.current_player else -6.0
+            return self._utility(term_wl, term_score)
+
         def _inference(self, state, legal_mask):
             p, v, _w = self.evaluator.evaluate(state[None], legal_mask[None])
             return p[0], float(v[0])
@@ -554,7 +578,7 @@ if _HAS_NUMBA:
                 for _ in range(batch):
                     gc = game.copy()
                     leaf, is_term, plen = _select_np(
-                        gc.board, gc._st, gc._go, gc._fp, gc._cap,
+                        gc.board, gc._st, gc._go, gc._fp, gc._cap, gc._hist,
                         self._parent, self._cstart, self._ccount, self._cmove, self._cnode,
                         self._visits, self._vsum, self._priors, self._vloss, self._expanded,
                         self._root, self.c_puct, self.vloss, self.board_size, self._path,
@@ -587,14 +611,7 @@ if _HAS_NUMBA:
                         wls[i] = xw[j]
                 for i, (leaf, gc, is_term, path, plen, legal_mask, legal_idx, legal_count) in enumerate(sims):
                     if is_term:
-                        if gc.winner is None:
-                            gc._compute_winner()
-                        if gc.winner == 0:
-                            value = 0.0
-                        else:
-                            term_score = gc.final_points * gc.current_player
-                            term_wl = 6.0 if gc.winner == gc.current_player else -6.0
-                            value = self._utility(term_wl, term_score)
+                        value = self._terminal_value(gc)
                         policy = np.zeros(0, dtype=np.float32)
                         has_policy = 0
                     else:

@@ -3,17 +3,43 @@
 """
 import numpy as np
 from numba import njit
-from hyperparams import (BOARD_SIZE, KOMI, PASS_MOVE,
-                         board_rules, PRUNE_DEAD_LUMPS,
+from hyperparams import (BOARD_SIZE, KOMI, PASS_MOVE, HOLE, MAX_BOARD_CELLS,
+                         board_rules, validate_hollow, PRUNE_DEAD_LUMPS,
                          INPUT_CHANNELS,
                          CH_OWN_STONES, CH_OPP_STONES, CH_LAST_MOVE, CH_KOMI,
                          CH_OWN_URGENCY, CH_OPP_URGENCY, CH_LEGAL_MASK,
                          CH_OWN_EYES, CH_OPP_EYES, CH_BOUNDARY)
 
-# Zobrist 表：只用于「上一局面」精确比对，替代旧的 ko 点 + captured>0 近似。
-# 颜色下标 0=黑、1=白；扁平下标 r*n+c，最大 19*19。
+
+def boundary_plane(board_size, hollow=0):
+    """生成边界输入通道：洞内 -1、内外边界 +1、其余可落子点 0。
+
+    13 路镂空 7×7 时：中心 7×7=-1，9×9 最外圈=+1，13×13 最外圈=+1，
+    其余可落子点=0。hollow=0 时退化为「最外圈 1、内部 0」。
+    """
+    n = int(board_size)
+    h = validate_hollow(n, hollow)
+    out = np.zeros((n, n), dtype=np.float32)
+    out[0, :] = 1.0
+    out[-1, :] = 1.0
+    out[:, 0] = 1.0
+    out[:, -1] = 1.0
+    if h:
+        lo = (n - h) // 2
+        hi = lo + h
+        out[lo:hi, lo:hi] = -1.0
+        # 洞外一圈：hollow+2 尺寸的空心矩形的最外圈。
+        out[lo - 1, lo - 1:hi + 1] = 1.0
+        out[hi, lo - 1:hi + 1] = 1.0
+        out[lo - 1:hi + 1, lo - 1] = 1.0
+        out[lo - 1:hi + 1, hi] = 1.0
+    return out
+
+# Zobrist 表：用于「全历史局面」精确比对（位置超级劫），
+# 同时保留上一局面哈希以兼容旧接口。
+# 颜色下标 0=黑、1=白；扁平下标 r*n+c，覆盖当前支持的最大棋盘。
 _ZOBRIST = np.random.RandomState(0x5EED).randint(
-    1, 2**63 - 1, size=(2, 19 * 19), dtype=np.uint64)
+    1, 2**63 - 1, size=(2, MAX_BOARD_CELLS), dtype=np.uint64)
 _MASK32 = np.uint64(0xFFFFFFFF)
 
 
@@ -41,9 +67,34 @@ def _board_hash(board, n):
     for r in range(n):
         for c in range(n):
             v = board[r, c]
-            if v != 0:
+            if v != 0 and v != HOLE:
                 h ^= _ZOBRIST[0 if v == 1 else 1, r * n + c]
     return h
+
+
+@njit(cache=True)
+def _sync_history(st, hist, cur_h):
+    """保证「当前局面」已写入历史，返回历史条数。
+
+    正常对局中当前局面就是历史最后一条，这里只做一次 O(1) 比对；
+    手工改棋盘/直接写 _st 的调用方（测试、SGF 导入等）会被顺带补上，
+    因此全历史判定对旧接口仍然成立。
+    """
+    hist_n = st[17]
+    if hist_n <= 0 or hist[hist_n - 1] != cur_h:
+        if hist_n < hist.shape[0]:
+            hist[hist_n] = cur_h
+            hist_n += 1
+            st[17] = hist_n
+    return hist_n
+
+
+@njit(cache=True)
+def _history_contains(hist, hist_n, h):
+    for i in range(hist_n):
+        if hist[i] == h:
+            return True
+    return False
 
 @njit(cache=True)
 def _group_has_liberty(board, r0, c0, n):
@@ -156,12 +207,13 @@ def _capture_opponent(board, row, col, player, n, cap):
     return count
 
 @njit(cache=True)
-def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h, use_hash, n):
+def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h,
+                   use_hash, n, hist, hist_n):
     """等价 Python _is_legal_move（临时落子后恢复，不污染棋盘）。
 
-    use_hash=True 时，用「落子后的局面哈希 == 上一局面哈希」判劫，而不是旧的
-    「劫点 + captured>0」。这样劫点上的多子提不会误禁；use_hash=False 仅供没有
-    历史状态的 _legal_mask_for 兼容旧行为。
+    use_hash=True 时，用「落子后的局面哈希」与全历史比对判位置超级劫；
+    没有历史状态的调用方（_legal_mask_for 的 D4 增强）仍用旧 ko 点判据。
+    非提子着法不可能重现旧局面，因此只在 captured>0 时查历史。
     """
     if board[row, col] != 0:
         return False
@@ -176,8 +228,11 @@ def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h, use_hash,
             h = cur_h ^ _ZOBRIST[ci, row * n + col]
             for j in range(captured):
                 h ^= _ZOBRIST[opp, cap[j]]
-            if h == prev_h:
-                return False                      # 精确还原上一局面 = 劫
+            if hist_n > 0:
+                if _history_contains(hist, hist_n, h):
+                    return False                  # 重现历史局面 = 超级劫
+            elif h == prev_h:
+                return False
         elif ko_r != -2 and row == ko_r and col == ko_c:
             return False                          # 无历史状态时的旧兼容判据
     if captured == 0:
@@ -188,16 +243,18 @@ def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h, use_hash,
     return True
 
 @njit(cache=True)
-def _make_move(board, st, go, fp, row, col, cap):
-    """落子（含 Pass/提子/劫检测）。
+def _make_move(board, st, go, fp, row, col, cap, hist):
+    """落子（含 Pass/提子/超级劫检测），非法超级劫着法会回滚并返回 False。
     st: [0]当前玩家 [1]上一步r [2]上一步c [3]劫r [4]劫c
         [5]步数 [6]连续pass [7]黑总pass [8]白总pass [9]winner(-2=None)
         [10]min_moves [11]max_moves [12]pass_limit
-        [13:15]当前局面 Zobrist 哈希 [15:17]上一局面哈希。
+        [13:15]当前局面 Zobrist 哈希 [15:17]上一局面哈希
+        [17]历史局面条数。
     """
     n = board.shape[0]
-    prev_h = ((np.uint64(st[13]) & _MASK32)
-              | ((np.uint64(st[14]) & _MASK32) << np.uint64(32)))
+    cur_h = ((np.uint64(st[13]) & _MASK32)
+             | ((np.uint64(st[14]) & _MASK32) << np.uint64(32)))
+    hist_n = _sync_history(st, hist, cur_h)
     if row == -1 and col == -1:                   # Pass
         st[1] = -1
         st[2] = -1
@@ -210,11 +267,11 @@ def _make_move(board, st, go, fp, row, col, cap):
         st[6] += 1
         st[5] += 1
         st[0] = -st[0]
-        _set_hash_slots(st, prev_h, prev_h)
+        _set_hash_slots(st, cur_h, cur_h)
         if st[6] >= 2 or st[5] >= st[11]:
             go[0] = True
         return True
-    h = prev_h
+    h = cur_h
     ci = 0 if st[0] == 1 else 1
     h ^= _ZOBRIST[ci, row * n + col]
     board[row, col] = st[0]
@@ -224,7 +281,14 @@ def _make_move(board, st, go, fp, row, col, cap):
             idx = cap[j]
             h ^= _ZOBRIST[1 - ci, idx]
             board[idx // n, idx % n] = 0
-        if captured == 1:                         # 劫检测（等价 Python 逻辑）
+        # 全历史比对：非提子着法不可能重现旧局面，只有提子才需要查。
+        if hist_n > 0 and _history_contains(hist, hist_n, h):
+            for j in range(captured):              # 回滚：还原被提子与本手
+                idx = cap[j]
+                board[idx // n, idx % n] = -st[0]
+            board[row, col] = 0
+            return False
+        if captured == 1:                         # 简单劫点标记（仅供旧接口/GUI 展示）
             ko_r = cap[0] // n
             ko_c = cap[0] % n
             board[ko_r, ko_c] = -st[0]
@@ -246,14 +310,80 @@ def _make_move(board, st, go, fp, row, col, cap):
     st[2] = col
     st[6] = 0
     st[5] += 1
-    _set_hash_slots(st, h, prev_h)
+    _set_hash_slots(st, h, cur_h)
+    if hist_n < hist.shape[0]:                     # 记录本手后的局面
+        hist[hist_n] = h
+        st[17] = hist_n + 1
     st[0] = -st[0]          # 终局后 current_player = 下一手方，终局价值口径与双 Pass 一致
     if st[5] >= st[11]:
         go[0] = True
     return True
 
 @njit(cache=True)
-def _legal_moves_and_mask(board, st, n, moves, mask):
+def _move_captures(board, r, c, player, n, seen, stack, stamp):
+    """快速判断在 (r,c) 落子是否会提掉相邻敌块。
+
+    只对「有相邻空点」的候选点使用；有相邻空点仍可能提子
+    （空点只给新子提供气，不一定给相邻敌块提供气），因此不能一概走快速路径。
+    先看相邻敌子本地是否有空邻点；有则其整块必有气，可跳过 BFS。
+    """
+    opp = -player
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr = r + dr
+        nc = c + dc
+        if not (0 <= nr < n and 0 <= nc < n) or board[nr, nc] != opp:
+            continue
+        idx0 = nr * n + nc
+        if seen[idx0] == stamp:
+            continue
+        # 本地快速排除：该敌子除 (r,c) 外还有空邻点，整块至少有这口气。
+        local_air = False
+        for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            r2 = nr + dr2
+            c2 = nc + dc2
+            if not (0 <= r2 < n and 0 <= c2 < n):
+                continue
+            if r2 == r and c2 == c:
+                continue
+            if board[r2, c2] == 0:
+                local_air = True
+                break
+        if local_air:
+            continue
+        top = 0
+        stack[top] = idx0
+        top += 1
+        seen[idx0] = stamp
+        has_air = False
+        while top > 0:
+            top -= 1
+            cur = stack[top]
+            cr = cur // n
+            cc = cur % n
+            for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                r2 = cr + dr2
+                c2 = cc + dc2
+                if not (0 <= r2 < n and 0 <= c2 < n):
+                    continue
+                v = board[r2, c2]
+                if v == 0:
+                    if not (r2 == r and c2 == c):
+                        has_air = True
+                elif v == opp:
+                    idx2 = r2 * n + c2
+                    if seen[idx2] != stamp:
+                        seen[idx2] = stamp
+                        stack[top] = idx2
+                        top += 1
+            if has_air:
+                break
+        if not has_air:
+            return True
+    return False
+
+
+@njit(cache=True)
+def _legal_moves_and_mask(board, st, n, moves, mask, hist):
     """合法着法；moves: int32缓冲(n*n+1)，mask: float32(n*n+1)"""
     total = n * n
     mask[:] = 0.0
@@ -268,6 +398,9 @@ def _legal_moves_and_mask(board, st, n, moves, mask):
         mask[total] = 1.0
         return count
     cur_h, prev_h = _hash_from_slots(st)
+    hist_n = _sync_history(st, hist, cur_h)
+    seen = np.zeros(total, dtype=np.int32)
+    stack = np.zeros(total, dtype=np.int32)
     for r in range(n):
         for c in range(n):
             if board[r, c] != 0:
@@ -282,15 +415,29 @@ def _legal_moves_and_mask(board, st, n, moves, mask):
                 has_air = True
             elif c < n - 1 and board[r, c + 1] == 0:
                 has_air = True
-            # 劫点不能走「邻格为空」快速路径：这里要用上一局面哈希精确比对。
+            # 有相邻空点也可能提子（还取决于敌块是否另有气），
+            # 提子就可能重现历史局面，必须走完整判定。
             is_ko = st[3] != -2 and r == st[3] and c == st[4]
-            if has_air and not is_ko:              # 快速路径：邻格为空且不是劫点
-                moves[count] = i
-                count += 1
-                mask[i] = 1.0
-                continue
+            if has_air and not is_ko:
+                opp = -st[0]
+                adj_opp = False
+                if r > 0 and board[r - 1, c] == opp:
+                    adj_opp = True
+                elif r < n - 1 and board[r + 1, c] == opp:
+                    adj_opp = True
+                elif c > 0 and board[r, c - 1] == opp:
+                    adj_opp = True
+                elif c < n - 1 and board[r, c + 1] == opp:
+                    adj_opp = True
+                if (not adj_opp
+                        or not _move_captures(board, r, c, st[0], n,
+                                              seen, stack, i + 1)):
+                    moves[count] = i
+                    count += 1
+                    mask[i] = 1.0
+                    continue
             if _is_legal_impl(board, r, c, st[0], st[3], st[4],
-                              cur_h, prev_h, True, n):
+                              cur_h, prev_h, True, n, hist, hist_n):
                 moves[count] = i
                 count += 1
                 mask[i] = 1.0
@@ -306,8 +453,10 @@ def _legal_mask_for(board, player, ko_r, ko_c, n, mask):
     """只算棋盘合法点（不含 pass），用于黑白互换增强重算 legal 通道。
 
     board 用绝对/当前玩家相对符号均可，只要与 player 一致；ko_r/ko_c=-2 表示无劫。
+    这里没有历史局面，超级劫退化为旧的 ko 点判据。
     """
     mask[:] = 0.0
+    dummy_hist = np.zeros(1, dtype=np.uint64)
     for r in range(n):
         for c in range(n):
             if board[r, c] != 0:
@@ -325,7 +474,7 @@ def _legal_mask_for(board, player, ko_r, ko_c, n, mask):
             is_ko = ko_r != -2 and r == ko_r and c == ko_c
             if (has_air and not is_ko) or _is_legal_impl(
                     board, r, c, player, ko_r, ko_c,
-                    np.uint64(0), np.uint64(0), False, n):
+                    np.uint64(0), np.uint64(0), False, n, dummy_hist, 0):
                 mask[i] = 1.0
 
 
@@ -333,78 +482,83 @@ def _legal_mask_for(board, player, ko_r, ko_c, n, mask):
 def _eye_color(board, n, r, c):
     """点 (r,c) 是不是「单点真眼」；是则返回眼的归属色（+1/-1），不是返回 0。
 
-    判据（贴边/角时方向数自动变少，无需特判）：
-      ① 上下左右（盘内）必须全是同一种颜色的子；
-      ② 对角：**中心**（4 个对角在盘内）至多 1 个敌方子；**边/角**（2/1 个对角）必须全为己方。
-    ② 上中心比边角松是刻意的：中心那 1 个"可疑对角"要配合"周围子被打吃"才真失效，
-    而边/角上唯一/少数对角一旦是空或敌方，对手就有落子成形的余地。
-    ⚠️ 代价：**角/边上"对角为空"的真眼会记 0**（那种形状是活的），通道因此偏保守。
-    要统一成中心的宽松口径，把下面 bad 的判据改成"只数敌方、阈值恒为 1"即可。
-
-    只判「这个点能不能被对手落子破掉」这一层，不看周围棋块自己活不活 —— 后者要靠
-    Benson 那类全域判据，代价远超这里的收益。
+    判据（贴边/角/镂空边时方向数自动变少，无需特判）：
+      ① 上下左右（盘内且不是洞）必须全是同一种颜色的子；
+      ② 对角：**中心**（4 个对角在盘内）至多 1 个敌方子；**边/角/洞边**
+         （2/1 个有效对角）必须全为己方。
+    洞与棋盘外同义：既不是气，也不是敌方子，不参与对角计数。
     """
     col = 0
-    # ① 四个正邻：同色且非空
+    # ① 四个正邻：同色且非空；洞视作盘外，跳过。
     if r > 0:
         v = board[r - 1, c]
-        if v == 0:
-            return 0
-        col = v
+        if v != HOLE:
+            if v == 0:
+                return 0
+            col = v
     if r < n - 1:
         v = board[r + 1, c]
-        if v == 0 or (col != 0 and v != col):
-            return 0
-        if col == 0:
-            col = v
+        if v != HOLE:
+            if v == 0 or (col != 0 and v != col):
+                return 0
+            if col == 0:
+                col = v
     if c > 0:
         v = board[r, c - 1]
-        if v == 0 or (col != 0 and v != col):
-            return 0
-        if col == 0:
-            col = v
+        if v != HOLE:
+            if v == 0 or (col != 0 and v != col):
+                return 0
+            if col == 0:
+                col = v
     if c < n - 1:
         v = board[r, c + 1]
-        if v == 0 or (col != 0 and v != col):
-            return 0
-        if col == 0:
-            col = v
-    # ② 对角：nd = 在盘内的对角数（4=中心、2=边、1=角），enemy=敌方数，nonown=非己方数（含空）
+        if v != HOLE:
+            if v == 0 or (col != 0 and v != col):
+                return 0
+            if col == 0:
+                col = v
+    if col == 0:
+        return 0
+    # ② 对角：nd = 有效对角数（4=中心、2=边、1=角/洞边），enemy=敌方数，nonown=非己方数（含空）
     nd = 0
     enemy = 0
     nonown = 0
     if r > 0 and c > 0:
-        nd += 1
         v = board[r - 1, c - 1]
-        if v == -col:
-            enemy += 1
-            nonown += 1
-        elif v == 0:
-            nonown += 1
+        if v != HOLE:
+            nd += 1
+            if v == -col:
+                enemy += 1
+                nonown += 1
+            elif v == 0:
+                nonown += 1
     if r > 0 and c < n - 1:
-        nd += 1
         v = board[r - 1, c + 1]
-        if v == -col:
-            enemy += 1
-            nonown += 1
-        elif v == 0:
-            nonown += 1
+        if v != HOLE:
+            nd += 1
+            if v == -col:
+                enemy += 1
+                nonown += 1
+            elif v == 0:
+                nonown += 1
     if r < n - 1 and c > 0:
-        nd += 1
         v = board[r + 1, c - 1]
-        if v == -col:
-            enemy += 1
-            nonown += 1
-        elif v == 0:
-            nonown += 1
+        if v != HOLE:
+            nd += 1
+            if v == -col:
+                enemy += 1
+                nonown += 1
+            elif v == 0:
+                nonown += 1
     if r < n - 1 and c < n - 1:
-        nd += 1
         v = board[r + 1, c + 1]
-        if v == -col:
-            enemy += 1
-            nonown += 1
-        elif v == 0:
-            nonown += 1
+        if v != HOLE:
+            nd += 1
+            if v == -col:
+                enemy += 1
+                nonown += 1
+            elif v == 0:
+                nonown += 1
     if nd == 4:
         return col if enemy <= 1 else 0
     return col if nonown == 0 else 0
@@ -440,7 +594,7 @@ def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
     for r in range(n):
         for c in range(n):
             color = board[r, c]
-            if color == 0 or labels[r, c] != 0:
+            if color == 0 or color == HOLE or labels[r, c] != 0:
                 continue
             nblk += 1
             gid = nblk
@@ -563,19 +717,19 @@ def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
             if board[r, c] != 0:
                 continue
             k = 0
-            if r > 0 and board[r - 1, c] != 0:
+            if r > 0 and board[r - 1, c] != 0 and board[r - 1, c] != HOLE:
                 blk_l[k] = labels[r - 1, c]
                 blk_c[k] = board[r - 1, c]
                 k += 1
-            if r < n - 1 and board[r + 1, c] != 0:
+            if r < n - 1 and board[r + 1, c] != 0 and board[r + 1, c] != HOLE:
                 blk_l[k] = labels[r + 1, c]
                 blk_c[k] = board[r + 1, c]
                 k += 1
-            if c > 0 and board[r, c - 1] != 0:
+            if c > 0 and board[r, c - 1] != 0 and board[r, c - 1] != HOLE:
                 blk_l[k] = labels[r, c - 1]
                 blk_c[k] = board[r, c - 1]
                 k += 1
-            if c < n - 1 and board[r, c + 1] != 0:
+            if c < n - 1 and board[r, c + 1] != 0 and board[r, c + 1] != HOLE:
                 blk_l[k] = labels[r, c + 1]
                 blk_c[k] = board[r, c + 1]
                 k += 1
@@ -643,32 +797,36 @@ def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
             cc = cur % n
             if cr > 0 and board[cr - 1, cc] != 0:
                 v = board[cr - 1, cc]
-                if col == 0:
-                    col = v
-                elif v != col:
-                    bad = True
-                    break
+                if v != HOLE:
+                    if col == 0:
+                        col = v
+                    elif v != col:
+                        bad = True
+                        break
             if cr < n - 1 and board[cr + 1, cc] != 0:
                 v = board[cr + 1, cc]
-                if col == 0:
-                    col = v
-                elif v != col:
-                    bad = True
-                    break
+                if v != HOLE:
+                    if col == 0:
+                        col = v
+                    elif v != col:
+                        bad = True
+                        break
             if cc > 0 and board[cr, cc - 1] != 0:
                 v = board[cr, cc - 1]
-                if col == 0:
-                    col = v
-                elif v != col:
-                    bad = True
-                    break
+                if v != HOLE:
+                    if col == 0:
+                        col = v
+                    elif v != col:
+                        bad = True
+                        break
             if cc < n - 1 and board[cr, cc + 1] != 0:
                 v = board[cr, cc + 1]
-                if col == 0:
-                    col = v
-                elif v != col:
-                    bad = True
-                    break
+                if v != HOLE:
+                    if col == 0:
+                        col = v
+                    elif v != col:
+                        bad = True
+                        break
         if bad or col == 0:
             continue
         if reg_size[rid] == 1:
@@ -717,7 +875,7 @@ def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
     for r in range(n):
         for c in range(n):
             b = board[r, c]
-            if b == 0:
+            if b == 0 or b == HOLE:
                 continue
             gid = labels[r, c]
             g = gid
@@ -734,7 +892,7 @@ def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
                 opp_eye[r, c] = ev
 
 @njit(cache=True)
-def _canonical_state(board, st, n, komi, player, out):
+def _canonical_state(board, st, n, komi, player, out, boundary):
     """当前玩家视角规范输入（训练/自对弈/MCTS/GUI 全链路共用同一编码）。
     各通道下标见 hyperparams 的 CH_* 常量 —— 布局只在那边定义一处，这里只负责填值。
     通道2=上一手位置；通道3=贴目标量 kch = player*komi/14（player=当前玩家色，黑+1/白-1；
@@ -746,11 +904,8 @@ def _canonical_state(board, st, n, komi, player, out):
     每个节点本来就要算一次，由调用方复用、见 get_canonical_state。"""
     kch = np.float32(player * komi / 14.0)
     last_valid = st[1] >= 0
-    # 固定边界通道：最外圈 1、内部 0；不存数据，按棋盘尺寸生成。
-    out[CH_BOUNDARY, 0, :] = 1.0
-    out[CH_BOUNDARY, n - 1, :] = 1.0
-    out[CH_BOUNDARY, :, 0] = 1.0
-    out[CH_BOUNDARY, :, n - 1] = 1.0
+    # 边界通道由 GoGame 每局预生成：洞 -1、内外边界 +1、其余可落子点 0。
+    out[CH_BOUNDARY] = boundary
     for r in range(n):
         for c in range(n):
             out[CH_OWN_STONES, r, c] = 1.0 if board[r, c] == player else 0.0
@@ -781,7 +936,7 @@ def _dead_lump_mask(board, n, out):
     for r in range(n):
         for c in range(n):
             color = board[r, c]
-            if color == 0 or labels[r, c] != 0:
+            if color == 0 or color == HOLE or labels[r, c] != 0:
                 continue
             gid = next_gid
             next_gid += 1
@@ -841,7 +996,7 @@ def _dead_lump_mask(board, n, out):
                         top += 1
     for r in range(n):
         for c in range(n):
-            if board[r, c] == 0:
+            if board[r, c] == 0 or board[r, c] == HOLE:
                 continue
             gid = labels[r, c]
             out[r, c] = (gsize[gid] <= 2) or (lib[gid] <= 1)
@@ -876,6 +1031,8 @@ def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
                             r_label[cr - 1, cc] = nr
                             stack[top] = cur - n
                             top += 1
+                    elif v == HOLE:
+                        pass
                     elif v == 1:
                         r_has_b[nr] = True
                     else:
@@ -888,6 +1045,8 @@ def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
                             r_label[cr + 1, cc] = nr
                             stack[top] = cur + n
                             top += 1
+                    elif v == HOLE:
+                        pass
                     elif v == 1:
                         r_has_b[nr] = True
                     else:
@@ -900,6 +1059,8 @@ def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
                             r_label[cr, cc - 1] = nr
                             stack[top] = cur - 1
                             top += 1
+                    elif v == HOLE:
+                        pass
                     elif v == 1:
                         r_has_b[nr] = True
                     else:
@@ -912,6 +1073,8 @@ def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
                             r_label[cr, cc + 1] = nr
                             stack[top] = cur + 1
                             top += 1
+                    elif v == HOLE:
+                        pass
                     elif v == 1:
                         r_has_b[nr] = True
                     else:
@@ -922,19 +1085,27 @@ def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
 class GoGame:
     """numba 加速版围棋（API 与 Python 版完全一致）"""
 
-    def __init__(self, board_size=BOARD_SIZE, komi=KOMI):
-        self.board_size = board_size
-        self.komi = komi
+    def __init__(self, board_size=BOARD_SIZE, komi=KOMI, hollow=0):
+        self.board_size = int(board_size)
+        self.komi = float(komi)
+        self.hollow = validate_hollow(self.board_size, hollow)
+        n = self.board_size
+        h = self.hollow
+        self._hole_lo = (n - h) // 2 if h else n
+        self._hole_hi = self._hole_lo + h if h else n
+        self._boundary = boundary_plane(n, h)
         self._simulate_mode = False
         self.reset()
 
     def reset(self):
         n = self.board_size
-        rules = board_rules(n)
+        rules = board_rules(n, self.hollow)
         self.board = np.zeros((n, n), dtype=np.int8)
+        if self.hollow:
+            self.board[self._hole_lo:self._hole_hi, self._hole_lo:self._hole_hi] = HOLE
         # [13:15] 当前局面 Zobrist 哈希，[15:17] 上一局面哈希；
-        # 劫判定用哈希精确比对，不再依赖「劫点 + captured>0」。
-        self._st = np.zeros(17, dtype=np.int32)
+        # [17] 全历史局面条数。劫判定使用全历史（位置超级劫）。
+        self._st = np.zeros(19, dtype=np.int32)
         self._st[0] = 1                    # 当前玩家
         self._st[1] = -2                   # 上一步 r（-2=None）
         self._st[2] = -2
@@ -944,6 +1115,8 @@ class GoGame:
         self._st[10] = rules["min_moves"]  # 前 N 手不允许 pass
         self._st[11] = rules["max_moves"]  # 单局最大手数
         self._st[12] = rules["pass_limit"] # 单方累计 pass 上限
+        self._st[17] = 1                   # 历史里已有空盘
+        self._hist = np.zeros(rules["max_moves"] + 2, dtype=np.uint64)
         self._go = np.zeros(1, dtype=np.bool_)
         self._fp = np.zeros(1, dtype=np.float64)
         self._cap = np.zeros(self.board_size * self.board_size, dtype=np.int32)
@@ -1034,18 +1207,24 @@ class GoGame:
             return False
         if (row, col) == PASS_MOVE:
             return self._st[5] >= self._st[10]
+        n = self.board_size
+        if not (0 <= row < n and 0 <= col < n):
+            return False
         if self.forced_pass():
             return False
         cur_h, prev_h = _hash_from_slots(self._st)
+        hist_n = _sync_history(self._st, self._hist, cur_h)
         return _is_legal_impl(self.board, row, col, self._st[0],
                               self._st[3], self._st[4], cur_h, prev_h,
-                              True, self.board_size)
+                              True, self.board_size, self._hist, hist_n)
 
     def make_move(self, row, col, check_legal=False):
         if check_legal and not self.is_legal_move(row, col):
             return False
-        _make_move(self.board, self._st, self._go, self._fp,
-                    row, col, self._cap)
+        ok = _make_move(self.board, self._st, self._go, self._fp,
+                        row, col, self._cap, self._hist)
+        if not ok:
+            return False
         if self._go[0] and not self._simulate_mode and self.winner is None:
             self._compute_winner()
         return True
@@ -1061,7 +1240,8 @@ class GoGame:
         total = n * n
         moves = np.zeros(total + 1, dtype=np.int32)
         mask = np.zeros(total + 1, dtype=np.float32)
-        cnt = _legal_moves_and_mask(self.board, self._st, n, moves, mask)
+        cnt = _legal_moves_and_mask(self.board, self._st, n, moves, mask,
+                                    self._hist)
         return moves[:cnt].copy(), mask
 
     def get_legal_moves_and_mask(self):
@@ -1083,7 +1263,8 @@ class GoGame:
         total = n * n
         moves = np.zeros(total + 1, dtype=np.int32)
         mask = np.zeros(total + 1, dtype=np.float32)
-        _legal_moves_and_mask(self.board, self._st, n, moves, mask)
+        _legal_moves_and_mask(self.board, self._st, n, moves, mask,
+                              self._hist)
         return mask
 
     def get_canonical_state(self, player=None, legal_mask=None):
@@ -1091,7 +1272,8 @@ class GoGame:
             player = self._st[0]
         n = self.board_size
         out = np.zeros((INPUT_CHANNELS, n, n), dtype=np.float32)
-        _canonical_state(self.board, self._st, n, self.komi, int(player), out)
+        _canonical_state(self.board, self._st, n, self.komi, int(player), out,
+                         self._boundary)
         if legal_mask is None:
             if int(player) == int(self._st[0]):
                 legal_mask = self.get_legal_mask()
@@ -1102,19 +1284,44 @@ class GoGame:
                 total = n * n
                 moves = np.zeros(total + 1, dtype=np.int32)
                 legal_mask = np.zeros(total + 1, dtype=np.float32)
-                _legal_moves_and_mask(self.board, st, n, moves, legal_mask)
+                # 传历史副本：st 是临时副本，_sync_history 不应改动本局历史计数。
+                _legal_moves_and_mask(self.board, st, n, moves, legal_mask,
+                                      self._hist.copy())
         # 掩码是 n*n+1、末位为 pass：19×19 平面装不下这一位，只取前 n*n 位。
         # 丢掉它不算信息回退 —— pass 合法性由步数下限决定，此前也从未进过任何通道。
         out[CH_LEGAL_MASK] = legal_mask[:n * n].reshape(n, n)
         return out
 
 
+    def is_hole(self, row, col):
+        n = self.board_size
+        return (0 <= row < n and 0 <= col < n
+                and self.board[row, col] == HOLE)
+
+    @property
+    def hole_lo(self):
+        return int(self._hole_lo)
+
+    @property
+    def hole_hi(self):
+        return int(self._hole_hi)
+
+    @property
+    def valid_mask(self):
+        """可落子点掩码（洞为 False；内外边界都算可落子）。"""
+        return self._boundary >= 0.0
+
     def copy(self):
         g = GoGame.__new__(GoGame)
         g.board_size = self.board_size
         g.komi = self.komi
+        g.hollow = self.hollow
+        g._hole_lo = self._hole_lo
+        g._hole_hi = self._hole_hi
+        g._boundary = self._boundary.copy()
         g.board = self.board.copy()
         g._st = self._st.copy()
+        g._hist = self._hist.copy()
         g._go = self._go.copy()
         g._fp = self._fp.copy()
         g._cap = np.zeros(self.board_size * self.board_size, dtype=np.int32)
@@ -1179,8 +1386,9 @@ class GoGame:
                 tw += int(r_size[rid])
             else:
                 neutral += int(r_size[rid])
-        # 归属图：活子±1；黑/白独占区域±1；中立=0
+        # 归属图：活子±1；黑/白独占区域±1；中立=0；洞=0
         own = clean.copy().astype(np.int8)
+        own[clean == HOLE] = 0
         for r in range(n):
             for c in range(n):
                 rid = r_label[r, c]
@@ -1200,5 +1408,9 @@ class GoGame:
         symbols = {0: '.', 1: 'X', -1: 'O'}
         s = "   " + " ".join(f"{i:2d}" for i in range(self.board_size)) + "\n"
         for i in range(self.board_size):
-            s += f"{i:2d} " + "  ".join(symbols[self.board[i, j]] for j in range(self.board_size)) + "\n"
+            line = []
+            for j in range(self.board_size):
+                v = self.board[i, j]
+                line.append('#' if v == HOLE else symbols[v])
+            s += f"{i:2d} " + "  ".join(line) + "\n"
         return s

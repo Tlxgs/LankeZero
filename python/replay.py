@@ -2,9 +2,10 @@
 
 每局一个 .npz，保存的是重建 10 通道输入所需的**最小信息**：
   board/player/last/legal + 4 个 uint8 特征平面（危急度x3、眼x2）；
-  第 10 通道是棋盘边界，运行时按尺寸生成，不落盘。
+  第 10 通道是棋盘边界，运行时按尺寸和 hollow 生成，不落盘。
 策略只存非零项（top-p 后通常十几个点），不存 362 维 float16 稠密向量。
-归属标签每局只存一份，样本只引用它。
+归属标签每局只存一份，样本只引用它；own_mask 标记这批样本是否参与归属损失。
+贴目按局存储：模型输入通道 3 用该局真实贴目，不再强制 7.5。
 
 旧 pkl / 旧 6 通道 / 旧 7 通道数据不兼容，也不尝试兼容。
 """
@@ -16,10 +17,12 @@ from datetime import datetime
 import numpy as np
 
 from hyperparams import (BOARD_SIZE, KOMI, PASS_MOVE, INPUT_CHANNELS,
-                         CH_BOUNDARY)
+                         CH_BOUNDARY, validate_hollow)
+from game import boundary_plane
 
 
-DATA_VERSION = 3
+DATA_VERSION = 5              # v5: 每局 hollow；v3/v4 仍可读（hollow 默认 0）
+SUPPORTED_DATA_VERSIONS = (3, 4, 5)
 FEATURE_CHANNELS = 4
 
 
@@ -30,10 +33,10 @@ class Sample:
     新对局样本没有磁盘来源，保持 None/-1。
     """
     __slots__ = ("board", "player", "last", "ko", "legal", "feat", "pidx", "pp", "own", "winner",
-                 "source", "index")
+                 "komi", "hollow", "own_mask", "source", "index")
 
     def __init__(self, board, player, last, ko, legal, feat, pidx, pp, own, winner,
-                 source=None, index=-1):
+                 komi=KOMI, hollow=0, own_mask=1, source=None, index=-1):
         self.board = board
         self.ko = int(ko)
         self.player = int(player)
@@ -44,12 +47,15 @@ class Sample:
         self.pp = pp
         self.own = own
         self.winner = int(winner)
+        self.komi = float(komi)
+        self.hollow = int(hollow)
+        self.own_mask = int(own_mask)
         self.source = source
         self.index = int(index)
 
 
 def state_to_sample(state, policy, player, last_move, ko_point=None):
-    """把 10 通道规范状态 + 稠密策略转成紧凑样本（不保存通道原图；边界按尺寸重建）。"""
+    """把 10 通道规范状态 + 稠密策略转成紧凑样本（不保存通道原图；边界按尺寸/镂空重建）。"""
     state = np.asarray(state, dtype=np.float32)
     n = state.shape[-1]
     total = n * n
@@ -88,9 +94,15 @@ def state_to_sample(state, policy, player, last_move, ko_point=None):
     }
 
 
-def pack_game(samples, moves, winner, score_diff, ownership, board_size=BOARD_SIZE):
-    """把一局紧凑样本打包成 savez 用的 dict。"""
+def pack_game(samples, moves, winner, score_diff, ownership, board_size=BOARD_SIZE,
+              komi=KOMI, hollow=0, own_mask=1):
+    """把一局紧凑样本打包成 savez 用的 dict。
+
+    komi 是该局真实贴目；hollow 是中心洞边长（0=实心）；
+    own_mask=0 表示这局只训练 policy/win，不训练 ownership。
+    """
     n = int(board_size)
+    hollow = validate_hollow(n, hollow)
     t = len(samples)
     if t == 0:
         raise ValueError("空对局不能保存")
@@ -122,6 +134,34 @@ def pack_game(samples, moves, winner, score_diff, ownership, board_size=BOARD_SI
         "winner": np.int8(winner),
         "score_diff": np.float32(score_diff),
         "ownership": np.asarray(ownership, dtype=np.int8).reshape(n, n),
+        "komi": np.float32(komi),
+        "hollow": np.int16(hollow),
+        "own_mask": np.uint8(own_mask),
+    }
+
+
+def payload_arrays(payload, board_size=BOARD_SIZE):
+    """把 pack_game 的 dict 转成 npz 的键值；贴目/归属掩码按 payload 落盘。"""
+    n = int(board_size)
+    return {
+        "version": np.int16(DATA_VERSION),
+        "board_size": np.int16(n),
+        "komi": np.float32(payload.get("komi", KOMI)),
+        "hollow": np.int16(payload.get("hollow", 0)),
+        "own_mask": np.uint8(payload.get("own_mask", 1)),
+        "boards": payload["boards"],
+        "players": payload["players"],
+        "lasts": payload["lasts"],
+        "kos": payload.get("kos", np.full(len(payload["boards"]), -1, dtype=np.int16)),
+        "legals": payload["legals"],
+        "feats": payload["feats"],
+        "pol_len": payload["pol_len"],
+        "pol_idx": payload["pol_idx"],
+        "pol_p": payload["pol_p"],
+        "moves": payload["moves"],
+        "winner": payload["winner"],
+        "score_diff": payload["score_diff"],
+        "ownership": payload["ownership"],
     }
 
 
@@ -152,8 +192,9 @@ def set_policy_onehot(path, sample_index, move_index):
     """
     path = os.path.abspath(path)
     arrays = load_npz_arrays(path)
-    if int(arrays["version"]) != DATA_VERSION:
-        raise ValueError("数据版本 %d != %d" % (int(arrays["version"]), DATA_VERSION))
+    if int(arrays["version"]) not in SUPPORTED_DATA_VERSIONS:
+        raise ValueError("数据版本 %d 不受支持（支持 %s）" % (
+            int(arrays["version"]), SUPPORTED_DATA_VERSIONS))
     n = int(arrays["board_size"])
     total = n * n + 1
     lens = arrays["pol_len"].astype(np.int64).reshape(-1)
@@ -197,6 +238,7 @@ class TrainingData:
         self.files = 0
         self.last_skipped = 0
         self.last_files = 0
+        self._boundary_cache = {}
         os.makedirs(data_dir, exist_ok=True)
 
     def __len__(self):
@@ -211,6 +253,9 @@ class TrainingData:
         samples = payload["samples"]
         own = payload["ownership"]
         winner = int(payload["winner"])
+        komi = float(payload.get("komi", KOMI))
+        hollow = validate_hollow(self.board_size, payload.get("hollow", 0))
+        own_mask = int(payload.get("own_mask", 1))
         take = samples[-self.max_size:]
         start = len(samples) - len(take)
         if source is not None:
@@ -222,6 +267,7 @@ class TrainingData:
             self.data.append(Sample(
                 s["board"], s["player"], s["last"], s.get("ko", -1),
                 s["legal"], s["feat"], s["pidx"], s["pp"], own, winner,
+                komi=komi, hollow=hollow, own_mask=own_mask,
                 source=source, index=start + j))
 
     def sample(self, batch_size):
@@ -234,31 +280,35 @@ class TrainingData:
         values = np.zeros((b,), dtype=np.float32)
         own = np.zeros((b, n, n), dtype=np.int8)
         kos = np.zeros((b,), dtype=np.int16)
+        own_masks = np.zeros((b,), dtype=np.uint8)
         eye3 = 1.0 / 3.0
         eye2 = 0.5
         for j, s in enumerate(batch):
             board = s.board.reshape(n, n)
             p = s.player
             kos[j] = s.ko
+            own_masks[j] = s.own_mask
+            key = (n, s.hollow)
+            bd = self._boundary_cache.get(key)
+            if bd is None:
+                bd = boundary_plane(n, s.hollow)
+                self._boundary_cache[key] = bd
             states[j, 0] = board > 0
             states[j, 1] = board < 0
             if s.last >= 0:
                 states[j, 2, s.last // n, s.last % n] = 1.0
-            states[j, 3] = p * KOMI / 14.0
+            states[j, 3] = p * s.komi / 14.0
             states[j, 4] = s.feat[0].reshape(n, n) * eye3
             states[j, 5] = s.feat[1].reshape(n, n) * eye3
             states[j, 6] = np.unpackbits(s.legal, count=total).reshape(n, n)
             states[j, 7] = s.feat[2].reshape(n, n) * eye2
             states[j, 8] = s.feat[3].reshape(n, n) * eye2
-            states[j, CH_BOUNDARY, 0, :] = 1.0
-            states[j, CH_BOUNDARY, n - 1, :] = 1.0
-            states[j, CH_BOUNDARY, :, 0] = 1.0
-            states[j, CH_BOUNDARY, :, n - 1] = 1.0
+            states[j, CH_BOUNDARY] = bd
             policies[j, s.pidx] = s.pp.astype(np.float32)
             if s.winner != 0:
                 values[j] = 1.0 if s.winner == p else -1.0
             own[j] = s.own * p
-        return states, policies, values, own, kos
+        return states, policies, values, own, kos, own_masks
 
     # ---------------- 落盘 / 读取 ----------------
     def save_game(self, payload, data_dir=None, prefix="data"):
@@ -271,25 +321,7 @@ class TrainingData:
         while os.path.exists(path):
             path = os.path.join(target, f"{base}_{suffix}.npz")
             suffix += 1
-        np.savez_compressed(
-            path,
-            version=np.int16(DATA_VERSION),
-            board_size=np.int16(self.board_size),
-            komi=np.float32(KOMI),
-            boards=payload["boards"],
-            players=payload["players"],
-            lasts=payload["lasts"],
-            kos=payload.get("kos", np.full(len(payload["boards"]), -1, dtype=np.int16)),
-            legals=payload["legals"],
-            feats=payload["feats"],
-            pol_len=payload["pol_len"],
-            pol_idx=payload["pol_idx"],
-            pol_p=payload["pol_p"],
-            moves=payload["moves"],
-            winner=payload["winner"],
-            score_diff=payload["score_diff"],
-            ownership=payload["ownership"],
-        )
+        np.savez_compressed(path, **payload_arrays(payload, self.board_size))
         self.files += 1
         n_saved = len(payload["boards"])
         print(f"[数据] 已保存 {n_saved} 条到 {path}")
@@ -332,12 +364,18 @@ class TrainingData:
         with np.load(filename, allow_pickle=False) as d:
             ver = int(d["version"])
             bs = int(d["board_size"])
-            if ver != DATA_VERSION:
-                raise ValueError(f"数据版本 {ver} != {DATA_VERSION}")
+            if ver not in SUPPORTED_DATA_VERSIONS:
+                raise ValueError(f"数据版本 {ver} 不受支持（支持 {SUPPORTED_DATA_VERSIONS}）")
             if bs != self.board_size:
                 raise ValueError(f"棋盘 {bs} != {self.board_size}")
-            if abs(float(d["komi"]) - KOMI) > 1e-6:
-                raise ValueError(f"贴目 {float(d['komi'])} != {KOMI}")
+            komi = float(d["komi"])
+            if not np.isfinite(komi) or komi < 0.0 or komi > 100.0:
+                raise ValueError(f"贴目 {komi} 超出合理范围")
+            hollow = int(d["hollow"]) if "hollow" in d.files else 0
+            hollow = validate_hollow(bs, hollow)
+            own_mask = int(d["own_mask"]) if "own_mask" in d.files else 1
+            if own_mask not in (0, 1):
+                raise ValueError(f"own_mask {own_mask} 必须是 0/1")
             boards = d["boards"]
             players = d["players"]
             lasts = d["lasts"]
@@ -357,6 +395,7 @@ class TrainingData:
                 break
             s = Sample(boards[i], players[i], lasts[i], kos[i], legals[i], feats[i],
                        pidx[off:off + k], pp[off:off + k], own, winner,
+                       komi=komi, hollow=hollow, own_mask=own_mask,
                        source=os.path.normcase(os.path.abspath(filename)), index=i)
             self.data.append(s)
             off += k

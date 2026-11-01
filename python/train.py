@@ -12,14 +12,15 @@ import torch.nn.functional as F
 
 from hyperparams import (BOARD_SIZE, NUM_SIMULATIONS, C_PUCT, BATCH_SIZE,
                          GRAD_ACCUM_STEPS, LEARNING_RATE, EYE_LR, GPOOL_LR,
-                         CH_OWN_EYES, CH_OPP_EYES, WEIGHT_DECAY, MOMENTUM,
+                         CH_OWN_EYES, CH_OPP_EYES, CH_BOUNDARY,
+                         WEIGHT_DECAY, MOMENTUM,
                          OPTIMIZER_NAME, WARMUP_STEPS, ENTROPY_TARGET,
                          ENTROPY_HINGE_WEIGHT, OWN_WEIGHT, WIN_WEIGHT,
                          GRAD_CLIP_NORM, DATA_DIR, MODEL_PATH, TRAINING_DATA_MAX,
                          PYTORCH_CUDA_ALLOC_CONF, MCTS_CAP, BATCH_SIZE_MCTS)
 from model import PolicyValueNet, GlobalPoolBias
 from replay import TrainingData
-from evaluator import GoEvaluator
+from trt_engine import make_evaluator
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", PYTORCH_CUDA_ALLOC_CONF)
 torch.backends.cudnn.benchmark = True
@@ -36,7 +37,8 @@ class SelfPlayTrainer:
                  learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
                  optimizer_name=OPTIMIZER_NAME, momentum=MOMENTUM,
                  freeze_parts=None, reset_norm=False, data_max=None,
-                 evaluator=None):
+                 evaluator=None, use_tensorrt=False, trt_engine_dir=None,
+                 log=None):
         self.board_size = board_size
         self.device = device
         self.num_simulations = num_simulations
@@ -46,6 +48,9 @@ class SelfPlayTrainer:
         self.weight_decay = weight_decay
         self.optimizer_name = optimizer_name.lower()
         self.momentum = momentum
+        self.use_tensorrt = bool(use_tensorrt)
+        self.trt_engine_dir = trt_engine_dir
+        self._log = log or (lambda message: print(message, flush=True))
         os.makedirs(data_dir, exist_ok=True)
         self.model_path = os.path.abspath(model_path)
 
@@ -65,8 +70,10 @@ class SelfPlayTrainer:
         self.grad_accum_steps = max(1, int(GRAD_ACCUM_STEPS))
         self._accum_steps_done = 0
         self._opt_steps = 0
-        self.evaluator = evaluator or GoEvaluator(
-            self.model, device=device, max_batch=BATCH_SIZE_MCTS, graph=True)
+        self.evaluator = evaluator or make_evaluator(
+            self.model, board_size=board_size, device=device,
+            max_batch=BATCH_SIZE_MCTS, use_tensorrt=self.use_tensorrt,
+            trt_engine_dir=trt_engine_dir, log=self._log)
 
         # 全项目只有一个权重：加载 model.pt，训练后原地原子覆盖 model.pt。
         self.last_saved = self.model_path
@@ -87,7 +94,7 @@ class SelfPlayTrainer:
         return torch.optim.Adam(groups, lr=self.learning_rate)
 
     @staticmethod
-    def _augment_batch(states, policies, values, ownerships, board_size):
+    def _augment_batch(states, policies, values, ownerships, own_masks, board_size):
         """只做 D4 八对称几何增强，不做黑白互换。策略 pass 位保持不变。
 
         为什么删掉黑白互换：贴目固定给白方，棋局对黑白并不对称。
@@ -129,19 +136,29 @@ class SelfPlayTrainer:
         out_p = np.empty_like(policies, dtype=np.float32)
         out_v = np.array(values, dtype=np.float32, copy=True)
         out_o = np.empty_like(ownerships, dtype=np.int8)
+        out_m = np.array(own_masks, dtype=np.uint8, copy=True)
         for i in range(batch_size):
             t = np.random.randint(len(transforms))
             out_s[i] = transforms[t][0](states[i])
             out_p[i] = transforms[t][1](policies[i])
             out_o[i] = own_funcs[t](ownerships[i])
-        return out_s, out_p, out_v, out_o
+        return out_s, out_p, out_v, out_o, out_m
+
+    @staticmethod
+    def _ownership_loss_mask(own_target, own_mask, valid):
+        """归属损失的样本掩码。
+
+        可落子点（valid=True）只训练非 0 标签，中立空点不强行给 0；
+        洞（valid=False）也纳入损失，目标固定为 0，让归属头学会输出 0。
+        """
+        return own_mask & (((own_target != 0) & valid) | (~valid))
 
     def train_step(self, batch_size=BATCH_SIZE):
         if len(self.data_buffer) < batch_size:
             return (None,) * self.LOSS_N
-        states, policies, values, ownerships, _kos = self.data_buffer.sample(batch_size)
-        states, policies, values, ownerships = self._augment_batch(
-            states, policies, values, ownerships, self.board_size)
+        states, policies, values, ownerships, _kos, own_masks = self.data_buffer.sample(batch_size)
+        states, policies, values, ownerships, own_masks = self._augment_batch(
+            states, policies, values, ownerships, own_masks, self.board_size)
         states_t = torch.from_numpy(states).to(self.device)
         policies_t = torch.from_numpy(policies).to(self.device)
 
@@ -154,12 +171,18 @@ class SelfPlayTrainer:
 
         own_logit = own_logits.squeeze(1)
         own_target = torch.from_numpy(ownerships).to(self.device).float()
-        mask = own_target != 0
+        own_mask = torch.from_numpy(own_masks).to(self.device).bool().view(-1, 1, 1)
+        # 边界通道 -1 = 洞。可落子点只训练非 0 标签；洞内也参与损失，目标 0。
+        valid = torch.from_numpy(states[:, CH_BOUNDARY] >= 0.0).to(self.device).bool()
+        mask = self._ownership_loss_mask(own_target, own_mask, valid)
         if not mask.any():
             own_loss = torch.zeros((), device=self.device)
         else:
+            # 洞内目标强制 0，避免旧数据/异常标签把洞教出非 0 归属。
+            own_loss_target = torch.where(valid, own_target,
+                                          torch.zeros_like(own_target))
             own_loss = F.binary_cross_entropy_with_logits(
-                2.0 * own_logit[mask], (own_target[mask] + 1.0) / 2.0)
+                2.0 * own_logit[mask], (own_loss_target[mask] + 1.0) / 2.0)
 
         win_target = (torch.from_numpy(values).to(self.device).float() + 1.0) / 2.0
         win_loss = F.binary_cross_entropy_with_logits(2.0 * win_logits.squeeze(1), win_target)
@@ -224,6 +247,7 @@ class SelfPlayTrainer:
 
         tag 只保留给旧调用方；不再生成任何新权重文件。先写 .tmp 再 os.replace，
         保存过程中崩溃也不会留下半截 model.pt。
+        TensorRT 开启时，保存后只做权重 refit（几十毫秒），不重建引擎。
         """
         path = self.model_path
         tmp = path + ".tmp"
@@ -231,7 +255,17 @@ class SelfPlayTrainer:
         os.replace(tmp, path)
         self.last_saved = path
         torch.cuda.empty_cache()
+        self._refit_tensorrt()
         return path
+
+    def _refit_tensorrt(self):
+        ev = getattr(self, "evaluator", None)
+        if ev is None or not hasattr(ev, "refit_from_model"):
+            return
+        try:
+            ev.refit_from_model(self.model)
+        except Exception as exc:
+            self._log("[TensorRT] refit 异常: %s" % exc)
 
     def load_training_data(self, filename=None, mode="newest"):
         if filename is not None:

@@ -9,7 +9,7 @@ torch.set_float32_matmul_precision('high')
 
 # 超参数（统一配置见 hyperparams.py）
 from hyperparams import (BOARD_SIZE, INPUT_CHANNELS, CHANNELS, HEAD_CHANNELS, NUM_RES_BLOCKS,
-                         DROPOUT_RATE)
+                         DROPOUT_RATE, CH_BOUNDARY)
 
 
 class GlobalPoolBias(nn.Module):
@@ -161,7 +161,11 @@ class PolicyValueNet(nn.Module):
         own_global = self.fc_own_global(                                        # (B, 1) 全局偏置（允许整体偏移）
             F.adaptive_avg_pool2d(own, 1).flatten(1))
         ownership_raw = own_local + own_global.view(-1, 1, 1, 1)                # (B, 1, H, W) 未压缩
-        ownership = torch.tanh(ownership_raw)                                   # (B, 1, H, W) ∈(-1,1)
+        # 边界通道 -1 = 洞。洞内不参与 value 求和；raw logit 不再硬置 0，
+        # 训练时把洞内目标也纳入归属损失（目标 0），让头自己学会输出 0。
+        # hollow=0 时 valid 全 1，行为与旧模型逐位一致。
+        valid = (x.select(1, CH_BOUNDARY).unsqueeze(1) >= 0.0).to(ownership_raw.dtype)
+        ownership = torch.tanh(ownership_raw) * valid                           # (B, 1, H, W)，洞内 0
         value = ownership.sum(dim=(2, 3))                                       # (B, 1) 期望领地目差（当前视角）
 
         # ---------- 胜率头（共享塔 + 1 层加深；全局平均池化 → 2 层 MLP；tanh 后=当前玩家胜率 ±1，MCTS 用 logit）----------
@@ -183,6 +187,8 @@ class PolicyValueNet(nn.Module):
                 policy_logits = policy_logits.masked_fill(legal_tensor == 0, -1e4)
             policy = F.softmax(policy_logits, dim=1)
             ownership = torch.tanh(ownership)                # (1,1,H,W) ∈(-1,1)
+            valid = (state_tensor[:, CH_BOUNDARY:CH_BOUNDARY + 1] >= 0.0).float()
+            ownership = ownership * valid                    # 洞内强制 0
             value = value.cpu().numpy()[0, 0]
             policy = policy.cpu().numpy()[0]
             ownership = ownership.cpu().numpy()[0, 0]
@@ -284,7 +290,7 @@ class PolicyValueNet(nn.Module):
 
         新增的边界通道（CH_BOUNDARY=9）接在输入末尾：旧 9 通道权重原样复制，
         新通道用 std=0.01 的小初始化，不破坏已有特征；数据无需改动，
-        边界通道由棋盘尺寸在 sample/canonical_state 里即时生成。
+        边界通道由棋盘尺寸和 hollow 在 sample/canonical_state 里即时生成。
         除 9→10 外，通道数或键不匹配仍直接报错。
         """
         checkpoint = torch.load(path, map_location=device, weights_only=False)

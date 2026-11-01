@@ -87,7 +87,7 @@ def play_one_game(mcts=None, evaluator=None, board_size=None,
                   c_puct=C_PUCT, temperature=TEMPERATURE,
                   exploration=EXPLORATION_MODE, model_path=None,
                   temperature_zero_after=_AUTO_TEMPERATURE_ZERO,
-                  max_moves=None, on_move=None):
+                  max_moves=None, on_move=None, hollow=0):
     """下一局，返回训练样本、回放着法和终局标签。
 
     mcts 可跨局复用；每局开始只 reset 根，不重新加载模型。
@@ -95,8 +95,9 @@ def play_one_game(mcts=None, evaluator=None, board_size=None,
     四角已占后的局面。max_moves 仅用于基准/冒烟测试：截断局不产生终局
     ownership，也不作为训练数据。
 
-    temperature_zero_after 默认按棋盘尺寸取 board_temperature_zero(n)：
-    9/13/19 路分别为 15/40/80 手；显式传 None 表示全程不切贪心（评估对局用）。
+    temperature_zero_after 默认按可落子面积取 board_temperature_zero(n, hollow)：
+    实心 7/9/11/13/15/17/19/21/23 路分别约为 11/18/27/37/50/64/79/97/116 手；
+    显式传 None 表示全程不切贪心（评估对局用）。
     """
     if board_size is None:
         if mcts is not None:
@@ -107,7 +108,7 @@ def play_one_game(mcts=None, evaluator=None, board_size=None,
             board_size = BOARD_SIZE
     board_size = int(board_size)
     if temperature_zero_after is _AUTO_TEMPERATURE_ZERO:
-        temperature_zero_after = board_temperature_zero(board_size)
+        temperature_zero_after = board_temperature_zero(board_size, hollow)
     if mcts is not None and mcts.board_size != board_size:
         raise ValueError("mcts.board_size=%d != board_size=%d" % (mcts.board_size, board_size))
     if mcts is None:
@@ -120,12 +121,13 @@ def play_one_game(mcts=None, evaluator=None, board_size=None,
         mcts = MCTS(evaluator=evaluator, num_simulations=num_simulations,
                     c_puct=c_puct, temperature=temperature, device=device,
                     board_size=board_size)
-    game = GoGame(board_size, komi=KOMI)
+    game = GoGame(board_size, komi=KOMI, hollow=hollow)
     mcts.reset()
     samples = []
     moves = []
     played = 0
-    if exploration:
+    # 四角固定开局只对实心棋盘生效；镂空盘的四角星位很可能落在洞里。
+    if exploration and game.hollow == 0:
         for r, c, pl in _exploration_opening(board_size):
             game.make_move(r, c)
             moves.append((r, c, pl))
@@ -169,7 +171,8 @@ def play_one_game(mcts=None, evaluator=None, board_size=None,
         score_diff = float(game.final_points)
     payload = None
     if samples:
-        payload = pack_game(samples, moves, winner, score_diff, ownership, board_size)
+        payload = pack_game(samples, moves, winner, score_diff, ownership,
+                            board_size, hollow=hollow)
     return {
         "samples": samples,
         "payload": payload,
@@ -177,5 +180,9 @@ def play_one_game(mcts=None, evaluator=None, board_size=None,
         "winner": winner,
         "score_diff": score_diff,
         "ownership": ownership,
+        # 内存缓冲直接 add_game(result)，必须带上 hollow/komi；
+        # 否则镂空局在本次训练缓冲里会被当成实心盘编码。
+        "hollow": int(hollow),
+        "komi": float(KOMI),
         "complete": not (truncated or aborted),
     }

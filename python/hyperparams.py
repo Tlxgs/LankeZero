@@ -7,8 +7,8 @@ game / mcts / model / train / train_gui / gui 都从这里取值，
 机器上跑不同规模。默认值按本机 RTX 3050 Laptop 4GB 设定；更小的卡可把
 GO_BATCH / GO_MCTS_BATCH / GO_DATA_MAX 调低。
 
-手数/Pass 规则按 BOARD_RULES 的棋盘尺寸写入 GoGame._st 运行时字段，
-不再有全局编译期常量。
+手数/Pass 规则按可落子面积比例计算，写入 GoGame._st 运行时字段，
+不再有 9/13/19 的尺寸表。
 
 注释只解释"为什么"，不复述参数取值——写死的数值会在参数改动后变成谎言。
 """
@@ -38,23 +38,70 @@ def _env_float(name, default):
 
 
 # ---------------- 棋盘 / 规则 ----------------
-BOARD_SIZE = 19                    # 默认棋盘路数（GUI 可选 9 / 13 / 19）
-BOARD_SIZES = (9, 13, 19)
-KOMI = 7.5                         # 贴目（白方补偿；三种棋盘共用，保证同一模型输入口径一致）
+BOARD_SIZE = 19                    # 默认棋盘路数
+BOARD_SIZES = (7, 9, 11, 13, 15, 17, 19, 21, 23)
+MAX_BOARD_SIZE = max(BOARD_SIZES)
+MAX_BOARD_CELLS = MAX_BOARD_SIZE * MAX_BOARD_SIZE
+KOMI = 7.5                         # 贴目（白方补偿；所有棋盘共用，保证同一模型输入口径一致）
 PASS_MOVE = (-1, -1)               # 停一手标记
+HOLE = 3                           # 棋盘数组里的镂空哨兵；0=空、1=黑、-1=白
+MIN_HOLLOW = 3                     # 最小镂空边长（3×3）；0 表示实心
 
-# 每种棋盘的手数/Pass 规则；运行时写入 GoGame._st，
-# 由 _make_move / _legal_moves_and_mask 读取，不再有全局编译期常量。
-BOARD_RULES = {
-    9:  {"max_moves": 180, "min_moves": 30,  "pass_limit": 40},
-    13: {"max_moves": 300, "min_moves": 100, "pass_limit": 60},
-    19: {"max_moves": 420, "min_moves": 320, "pass_limit": 100},
-}
+# 手数/Pass 规则统一按可落子面积线性缩放；不再维护 9/13/19 的表格。
+# 数值 = round(可落子点数 × 系数)，因此实心盘和镂空盘共用同一套比例。
+MAX_MOVES_PER_POINT = 1.3
+MIN_MOVES_PER_POINT = 0.6
+PASS_LIMIT_PER_POINT = 0.05
 
 
-def board_rules(board_size):
-    """返回棋盘的 (max_moves, min_moves, pass_limit)；未知尺寸按 19 路处理。"""
-    return BOARD_RULES.get(int(board_size), BOARD_RULES[19])
+def validate_hollow(board_size, hollow=0):
+    """校验并返回中心镂空边长。0=实心；否则必须是奇数，且至少留两圈。
+
+    至少两圈的条件是 hollow <= board_size - 4：例如 13 路最大 hollow=9，
+    13 路 hollow=11（只剩一圈）不允许。只允许奇数，所以 3/5/7/9 是 13 路的全部选择。
+    """
+    n = int(board_size)
+    h = int(hollow)
+    if h == 0:
+        return 0
+    if h % 2 == 0:
+        raise ValueError("镂空边长必须是奇数或 0: %d" % h)
+    if h < MIN_HOLLOW:
+        raise ValueError("镂空边长至少 %d: %d" % (MIN_HOLLOW, h))
+    if h > n - 4:
+        raise ValueError("棋盘 %d 路至少留两圈，镂空最大 %d，收到 %d"
+                         % (n, n - 4, h))
+    return h
+
+
+def hollow_choices(board_size):
+    """返回 GUI/CLI 可选的镂空边长列表：0, 3, 5, 7, ... <= n-4。"""
+    n = int(board_size)
+    return [0] + list(range(MIN_HOLLOW, n - 3, 2))
+
+
+def playable_area(board_size, hollow=0):
+    """可落子点数（洞不算棋盘）。"""
+    n = int(board_size)
+    h = validate_hollow(n, hollow)
+    return n * n - h * h
+
+
+def _area_round(area, ratio):
+    return max(1, int(area * ratio + 0.5))
+
+
+def board_rules(board_size, hollow=0):
+    """返回棋盘的 (max_moves, min_moves, pass_limit)。
+
+    只按可落子点数线性缩放，任意奇数棋盘/任意合法镂空都自动适用。
+    """
+    area = playable_area(board_size, hollow)
+    return {
+        "max_moves": _area_round(area, MAX_MOVES_PER_POINT),
+        "min_moves": _area_round(area, MIN_MOVES_PER_POINT),
+        "pass_limit": _area_round(area, PASS_LIMIT_PER_POINT),
+    }
 
 
 # 终局领地判定：盘上所有子都算活 + 空区域 flood fill（Tromp-Taylor 式，
@@ -91,15 +138,19 @@ UTIL_STDEV_SCALE = _env_float('GO_UTIL_STDEV_SCALE', 0.85)  # 波动加成的强
 # rootFpuReductionMax），给首访设了一道门槛。
 # 设 0 = 恢复原行为。⚠️ 改它等于换数据生成策略，与旧缓冲不同源。
 FPU_REDUCTION = _env_float('GO_FPU', 0.05)   # [可覆盖 GO_FPU] 未访问点的首访惩罚
+# PASS 终局的失败方价值（按最后一手 PASS 的人结算）。比 -1 略高，让劣势方在
+# “停一手输”与“继续填子也输”之间选择停一手；获胜方仍为 +1.0。
+# 只影响 MCTS 搜索值，不改训练标签。
+PASS_TERMINAL_LOSS = _env_float('GO_PASS_LOSS', -0.95)
 # 前 zero_after 手按访问计数比例采样（τ=1，即 AlphaZero 标准），之后转贪心。
 # 窗口内不做衰减：τ<1 是在"搜索标签本身已经变尖"之上再锐化一遍，等于对同一件事罚两次。
 # 手数长的棋盘可以晚点转贪心；9 路对局本来就短，若沿用 80 手会几乎整局都在 τ=1 采样。
 TEMPERATURE = 1.0                  # 训练开局温度（train_gui 滑块默认值）
-BOARD_TEMPERATURE_ZERO = {9: 15, 13: 40, 19: 80}  # 各尺寸第 N 手（含）起转贪心
+TEMPERATURE_ZERO_PER_POINT = 0.22  # 第 N 手（含）起转贪心，N 同样按可落子面积缩放
 
-def board_temperature_zero(board_size):
-    """返回某棋盘尺寸的贪心切换手数；未知尺寸按 19 路处理。"""
-    return BOARD_TEMPERATURE_ZERO.get(int(board_size), BOARD_TEMPERATURE_ZERO[19])
+def board_temperature_zero(board_size, hollow=0):
+    """返回某棋盘的贪心切换手数；实心/镂空都按可落子面积线性缩放。"""
+    return _area_round(playable_area(board_size, hollow), TEMPERATURE_ZERO_PER_POINT)
 
 TOP_P = 0.95                       # 累计概率截断，落子采样与训练目标共用一套规则（支撑集若不一致，
                                    # 网络就会去拟合一批对局时从未被考虑过的着法）
@@ -140,7 +191,8 @@ CH_LEGAL_MASK = 6                  # 合法点掩码：可落子 1、被禁 0。
                                    # 本来就能从 ch0/ch1 读出，而劫点坐标原先躺在 st[3]/st[4] 里没喂进网络。
 CH_OWN_EYES = 7                    # 己方棋块真眼数：0 眼=0、1 眼=0.5、>=2 眼=1（整块共享）
 CH_OPP_EYES = 8                    # 对方棋块真眼数（判据见 game._group_channels）
-CH_BOUNDARY = 9                    # 棋盘边界：最外圈 1、内部 0（固定通道，按尺寸生成，不存数据）
+CH_BOUNDARY = 9                    # 棋盘边界：洞 -1、可落子 0、内外边界 +1（按尺寸/hollow 生成，不存数据）
+                                   # hollow=0 时退化为「最外圈 1、内部 0」。
                                    # ⚠️ 改这个值 = 换了输入编码，旧 data/ 里的样本全部作废（张量已存盘，事后补不出来）
 CHANNELS = 128                      # 主干通道数
 HEAD_CHANNELS = 64                 # 头部通道数（KataGo 风格轻量塔：归属/胜率头共用第一层）

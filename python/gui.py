@@ -19,7 +19,7 @@ from hyperparams import (BOARD_SIZE, BOARD_SIZES, MODEL_PATH, KOMI, MCTS_CAP,
                          GUI_STEP_MS as STEP_MS,
                          CANDIDATE_MASS, MIN_CANDIDATES,
                          GUI_DEBUG as DEBUG, GUI_CRASH_LOG as CRASH_LOG,
-                         GUI_CRASH_NATIVE_LOG)
+                         GUI_CRASH_NATIVE_LOG, hollow_choices, validate_hollow)
 
 try:
     faulthandler.enable(open(GUI_CRASH_NATIVE_LOG, 'a', buffering=1))
@@ -27,6 +27,11 @@ except Exception:
     pass
 def _gui_cap(board_size):
     return max(MCTS_CAP, int(GUI_MAX_SIMS * board_size * board_size * 1.2))
+
+
+def _board_cell(board_size):
+    """大棋盘缩小格距，避免 21/23 路窗口超出屏幕。"""
+    return 60 if int(board_size) <= 19 else 48
 
 
 def _resolve_model_path():
@@ -37,15 +42,21 @@ def _resolve_model_path():
 class GomokuGUI:
     def __init__(self, device='cuda'):
         self.board_size = BOARD_SIZE
+        self.hollow = 0
         self.komi = KOMI
-        self.game = GoGame(board_size=BOARD_SIZE, komi=self.komi)
+        self.device = device
+        self.game = GoGame(board_size=BOARD_SIZE, komi=self.komi, hollow=self.hollow)
         self.model_path = _resolve_model_path()
         print('[GUI] 正在初始化本地推理引擎: %s' % self.model_path)
         try:
             from model import PolicyValueNet
-            from evaluator import GoEvaluator
+            from trt_engine import make_evaluator
             model = PolicyValueNet.load_model(self.model_path, device=device)
-            evaluator = GoEvaluator(model, device=device, max_batch=BATCH_SIZE_MCTS)
+            evaluator = make_evaluator(
+                model, board_size=BOARD_SIZE, device=device,
+                max_batch=BATCH_SIZE_MCTS, use_tensorrt=True,
+                log=lambda msg: print(msg, flush=True))
+            self.model = model
             self.evaluator = evaluator
             self.mcts = MCTS(evaluator=evaluator, c_puct=C_PUCT,
                              num_simulations=NUM_SIMULATIONS,
@@ -67,12 +78,12 @@ class GomokuGUI:
                 print(msg)
             raise SystemExit(1)
 
-        self.cell_size, self.margin = 60, 60
+        self.cell_size, self.margin = _board_cell(self.board_size), 60
         self.canvas_size = (self.board_size - 1) * self.cell_size + 2 * self.margin
 
         self.root = tk.Tk()
         self._setup_fonts()
-        self.root.title("围棋 AI - %d路 - %s" % (self.board_size, os.path.basename(self.model_path)))
+        self.root.title(self._window_title())
         self.root.resizable(True, True)
         self.root.bind("<space>", self._on_space_key)
 
@@ -132,6 +143,15 @@ class GomokuGUI:
                                 values=BOARD_SIZES, state="readonly", width=12)
         board_cb.grid(row=row, column=1, pady=3)
         board_cb.bind("<<ComboboxSelected>>", self._on_board_size_change)
+
+        row += 1
+        ttk.Label(ctrl, text="镂空:").grid(row=row, column=0, sticky="w", pady=3)
+        self.hollow_var = tk.IntVar(value=self.hollow)
+        self.hollow_cb = ttk.Combobox(ctrl, textvariable=self.hollow_var,
+                                      values=hollow_choices(self.board_size),
+                                      state="readonly", width=12)
+        self.hollow_cb.grid(row=row, column=1, pady=3)
+        self.hollow_cb.bind("<<ComboboxSelected>>", self._on_hollow_change)
 
         row += 1
         ttk.Label(ctrl, text="显示:").grid(row=row, column=0, sticky="w", pady=3)
@@ -209,7 +229,8 @@ class GomokuGUI:
         self.canvas = tk.Canvas(self.root, width=self.canvas_size, height=self.canvas_size,
                                 bg="#D1D1D1", highlightthickness=0)
         self.canvas.grid(row=0, column=1, padx=5, pady=10)
-        self.board = GameBoard(self.canvas, self.board_size, self.cell_size, self.margin)
+        self.board = GameBoard(self.canvas, self.board_size, self.cell_size,
+                               self.margin, hollow=self.hollow)
         self.canvas.bind("<Button-1>", self._on_click)
 
         # 搜索状态（单线程，无锁）
@@ -352,6 +373,8 @@ class GomokuGUI:
         # 2. 在每格中心画小正方形，颜色由 ownership 值映射为灰度
         for r in range(self.board_size):
             for c in range(self.board_size):
+                if self.game.is_hole(r, c):
+                    continue
                 x = self.margin + c * self.cell_size
                 y = self.margin + r * self.cell_size
                 d = float(np.nan_to_num(own[r, c], nan=0.0))  # ∈[-1, 1]
@@ -371,6 +394,8 @@ class GomokuGUI:
     def _draw_pieces(self):
         for r in range(self.board_size):
             for c in range(self.board_size):
+                if self.game.is_hole(r, c):
+                    continue
                 p = self.game.board[r, c]
                 if p:
                     self.board.draw_piece(r, c, p)
@@ -392,7 +417,7 @@ class GomokuGUI:
             if m == PASS_MOVE:
                 continue
             r, c = m
-            if self.game.board[r, c] != 0:
+            if self.game.is_hole(r, c) or self.game.board[r, c] != 0:
                 continue
             vis = ch.visit_count
             # 子节点存的是「轮到对手走」那一方的价值 ⇒ 取反才是我方胜率。
@@ -665,16 +690,32 @@ class GomokuGUI:
                 return
         self._search_gen += 1
         self.board_size = n
+        h = int(self.hollow)
+        if h > n - 4:
+            h = 0
+        self.hollow = h
+        self.hollow_cb["values"] = hollow_choices(n)
+        self.hollow_var.set(h)
         try:
             self.komi = float(self.komi_var.get())
         except Exception:
             self.komi = KOMI
-        self.game = GoGame(board_size=n, komi=self.komi)
-        self.cell_size, self.margin = 60, 60
+        self.game = GoGame(board_size=n, komi=self.komi, hollow=self.hollow)
+        self.cell_size, self.margin = _board_cell(n), 60
         self.canvas_size = (n - 1) * self.cell_size + 2 * self.margin
         self.canvas.config(width=self.canvas_size, height=self.canvas_size)
-        self.board = GameBoard(self.canvas, n, self.cell_size, self.margin)
+        self.board = GameBoard(self.canvas, n, self.cell_size, self.margin,
+                               hollow=self.hollow)
         old = self.mcts
+        try:
+            from trt_engine import make_evaluator
+            self.evaluator = make_evaluator(
+                self.model, board_size=n, device=self.device,
+                max_batch=BATCH_SIZE_MCTS, use_tensorrt=True,
+                log=lambda msg: print(msg, flush=True))
+        except Exception as e:
+            messagebox.showerror("推理引擎切换失败", "%s: %s" % (type(e).__name__, e))
+            return
         self.mcts = MCTS(evaluator=self.evaluator,
                          c_puct=old.c_puct, num_simulations=old.num_simulations,
                          temperature=old.temperature, alpha=old.alpha,
@@ -686,12 +727,44 @@ class GomokuGUI:
                          cap=_gui_cap(n),
                          fpu_reduction=old.fpu_reduction,
                          virtual_loss=old.vloss)
-        self.root.title("围棋 AI - %d路 - %s" % (n, os.path.basename(self.model_path)))
+        self.root.title(self._window_title())
         self._history.clear()
         self._update_score_diff()
         self._init_mcts()
         self._draw()
         self._start_search()
+
+    def _on_hollow_change(self, event=None):
+        h = int(self.hollow_var.get())
+        if h == self.hollow:
+            return
+        try:
+            h = validate_hollow(self.board_size, h)
+        except ValueError as exc:
+            messagebox.showerror("镂空非法", str(exc))
+            self.hollow_var.set(self.hollow)
+            return
+        if self.game.move_count > 0:
+            if not messagebox.askyesno("切换镂空", "切换镂空会重置当前对局，继续？"):
+                self.hollow_var.set(self.hollow)
+                return
+        self._search_gen += 1
+        self.hollow = h
+        self.game = GoGame(board_size=self.board_size, komi=self.komi,
+                           hollow=self.hollow)
+        self.board = GameBoard(self.canvas, self.board_size, self.cell_size,
+                               self.margin, hollow=self.hollow)
+        self.root.title(self._window_title())
+        self._history.clear()
+        self._update_score_diff()
+        self._init_mcts()
+        self._draw()
+        self._start_search()
+
+    def _window_title(self):
+        hollow = (" 镂空%d" % self.hollow) if self.hollow else ""
+        return "围棋 AI - %d路%s - %s" % (
+            self.board_size, hollow, os.path.basename(self.model_path))
 
     def _apply_params(self):
         self._search_gen += 1

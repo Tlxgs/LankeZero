@@ -1,6 +1,6 @@
 """围棋神经网络推理器：任意棋盘尺寸、批量前向、FP16 + channels_last + CUDA Graph。
 
-模型是全卷积 + 空间策略头，同一份权重可直接接收 9/13/19 路输入；
+模型是全卷积 + 空间策略头，同一份权重可直接接收 7–23 的奇数路输入；
 策略输出为 n*n+1（含 pass）。CUDA Graph 按棋盘尺寸分别缓存，互不干扰。
 """
 import threading
@@ -20,7 +20,7 @@ def resolve_device(device="auto"):
 class GoEvaluator:
     """把 (B,10,n,n) 局面 + (B,n*n+1) 合法掩码变成 (策略, 目差, 胜率 logit)。
 
-    同一实例可依次处理 9/13/19 路；每种尺寸单独捕获一张 CUDA Graph。
+    同一实例可依次处理 7–23 的奇数路；每种尺寸单独捕获一张 CUDA Graph。
     捕获失败自动退回普通前向。
     """
 
