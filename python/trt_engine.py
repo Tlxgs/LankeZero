@@ -24,7 +24,7 @@ from evaluator import GoEvaluator
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ENGINE_DIR = os.path.join(ROOT, "trt_engines")
-GRAPH_VERSION = 1
+GRAPH_VERSION = 5          # 5: value 回归 Σtanh(own)（去掉推理期 1.05 校准），旧引擎必须重建
 DEFAULT_BATCH = 16
 DEFAULT_PRECISION = "fp16"
 
@@ -104,11 +104,14 @@ def architecture_signature(model):
         "format_version": int(getattr(model, "FORMAT_VERSION", 0)),
         "architecture": str(getattr(model, "ARCHITECTURE", "")),
         "input_channels": int(getattr(model, "input_channels", 0)),
+        "global_dim": int(getattr(model, "global_dim", 0)),
         "channels": int(getattr(model, "channels", 0)),
         "num_res_blocks": int(getattr(model, "num_res_blocks", 0)),
         "head_channels": int(getattr(model, "head_channels", 0)),
+        "input_kernel": int(getattr(model, "input_kernel", 0)),
+        "gpool_blocks": list(getattr(model, "gpool_blocks", ())),
         "dropout_rate": float(getattr(model, "dropout_rate", 0.0)),
-        "graph_version": GRAPH_VERSION,
+            "graph_version": GRAPH_VERSION,
     }
 
 
@@ -160,6 +163,12 @@ def manifest_problem(manifest, model, board_size, batch, precision):
     if str(manifest.get("tensorrt_version", "")) != str(trt.__version__):
         return "TensorRT 版本变化（引擎 %s，当前 %s）" % (
             manifest.get("tensorrt_version"), trt.__version__)
+    cuda_now = str(torch.version.cuda or "")
+    if str(manifest.get("cuda_version", "")) != cuda_now:
+        # 引擎里固化的是某个 CUDA 版本编出来的 kernel，跨版本反序列化可能失败
+        # 或算错。manifest 一直都写了 cuda_version，但之前从来没人比对。
+        return "CUDA 版本变化（引擎 %s，当前 %s）" % (
+            manifest.get("cuda_version"), cuda_now)
     gpu, cc = _device_info()
     if manifest.get("gpu") and gpu and manifest.get("gpu") != gpu:
         return "GPU 变化"
@@ -177,8 +186,8 @@ class _PolicyOutputs(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, x):
-        policy, value, _ownership, win = self.model(x)
+    def forward(self, x, g):
+        policy, value, _ownership, win = self.model(x, g)
         return policy, value, win
 
 
@@ -202,17 +211,30 @@ def build_engine(model, board_size, engine_dir_path=None,
 
     import copy
     cpu_model = copy.deepcopy(model).cpu().eval()
+    # ONNX's exporter deduplicates identical initializers (e.g. every RMSNorm
+    # weight starts at 1.0, every gpool fc2 starts at 0).  Deduplicated tensors
+    # become Identity aliases, so TensorRT REFIT reports the aliases as missing
+    # and can no longer update them independently.  Perturb the *export copy*
+    # only; the real model is untouched and refit writes the real values back.
+    with torch.no_grad():
+        for i, (name, p) in enumerate(cpu_model.named_parameters()):
+            if p.numel():
+                p.add_(1e-4 * (i + 1))
     dummy = torch.zeros(int(batch), int(cpu_model.input_channels),
                         int(board_size), int(board_size), dtype=torch.float32)
+    dummy_global = torch.zeros(int(batch), int(cpu_model.global_dim),
+                               dtype=torch.float32)
     onnx_path = engine_path + ".onnx.tmp"
     tmp_engine = engine_path + ".tmp"
     log("[TensorRT] 导出 ONNX: %d 路 batch=%d %s" % (board_size, batch, precision))
     t0 = time.perf_counter()
     torch.onnx.export(
-        _PolicyOutputs(cpu_model).eval(), (dummy,), onnx_path,
+        _PolicyOutputs(cpu_model).eval(), (dummy, dummy_global), onnx_path,
         opset_version=17,
-        input_names=["state"], output_names=["policy", "value", "win"],
+        input_names=["state", "globals"],
+        output_names=["policy", "value", "win"],
         dynamic_axes={"state": {0: "batch"},
+                      "globals": {0: "batch"},
                       "policy": {0: "batch"},
                       "value": {0: "batch"},
                       "win": {0: "batch"}},
@@ -248,6 +270,9 @@ def build_engine(model, board_size, engine_dir_path=None,
     shape = (1, int(cpu_model.input_channels), int(board_size), int(board_size))
     opt = (int(batch), int(cpu_model.input_channels), int(board_size), int(board_size))
     profile.set_shape("state", shape, opt, opt)
+    gshape = (1, int(cpu_model.global_dim))
+    gopt = (int(batch), int(cpu_model.global_dim))
+    profile.set_shape("globals", gshape, gopt, gopt)
     config.add_optimization_profile(profile)
     log("[TensorRT] 构建引擎（首次可能 1–6 分钟）...")
     serialized = builder.build_serialized_network(network, config)
@@ -325,6 +350,7 @@ class TrtEngine:
     def _build_tensors(self):
         trt = self.trt
         input_channels = None
+        global_dim = None
         for i in range(self.engine.num_bindings):
             name = self.engine.get_binding_name(i)
             is_input = self.engine.binding_is_input(i)
@@ -334,14 +360,26 @@ class TrtEngine:
                 raise RuntimeError("不支持的绑定格式: %s dtype=%s format=%s"
                                    % (name, dtype, fmt))
             if is_input:
-                self.input_idx = i
                 shape = tuple(self.engine.get_binding_shape(i))
-                if len(shape) != 4 or shape[1] <= 0:
-                    raise RuntimeError("输入绑定形状异常: %s" % (shape,))
-                input_channels = int(shape[1])
-                tensor = torch.zeros((self.batch, input_channels,
-                                      self.n, self.n), dtype=torch.float32,
-                                     device="cuda")
+                if name == "state":
+                    if len(shape) != 4 or shape[1] <= 0:
+                        raise RuntimeError("state 绑定形状异常: %s" % (shape,))
+                    input_channels = int(shape[1])
+                    tensor = torch.zeros((self.batch, input_channels,
+                                          self.n, self.n), dtype=torch.float32,
+                                         device="cuda")
+                    self.state_idx = i
+                    self.state_t = tensor
+                elif name == "globals":
+                    if len(shape) != 2 or shape[1] <= 0:
+                        raise RuntimeError("globals 绑定形状异常: %s" % (shape,))
+                    global_dim = int(shape[1])
+                    tensor = torch.zeros((self.batch, global_dim),
+                                         dtype=torch.float32, device="cuda")
+                    self.global_idx = i
+                    self.global_t = tensor
+                else:
+                    raise RuntimeError("未知输入绑定: %s shape=%s" % (name, shape))
             else:
                 if name == "policy":
                     h = (self.batch, self.n * self.n + 1)
@@ -352,15 +390,20 @@ class TrtEngine:
                 tensor = torch.zeros(h, dtype=torch.float32, device="cuda")
             self.tensors.append({"name": name, "input": is_input,
                                  "t": tensor})
-        if self.input_idx is None:
-            raise RuntimeError("引擎没有输入绑定")
+        if getattr(self, "state_idx", None) is None:
+            raise RuntimeError("引擎缺少 state 输入")
+        if getattr(self, "global_idx", None) is None:
+            raise RuntimeError("引擎缺少 globals 输入")
         self.input_channels = input_channels
-        self.input_t = next(t["t"] for t in self.tensors if t["input"])
+        self.global_dim = global_dim
         self.outputs = {t["name"]: t["t"] for t in self.tensors if not t["input"]}
         if self.context.set_binding_shape(
-                self.input_idx,
+                self.state_idx,
                 (self.batch, input_channels, self.n, self.n)) is False:
-            raise RuntimeError("set_binding_shape 失败")
+            raise RuntimeError("set_binding_shape(state) 失败")
+        if self.context.set_binding_shape(
+                self.global_idx, (self.batch, global_dim)) is False:
+            raise RuntimeError("set_binding_shape(globals) 失败")
 
     def refit_from_model(self, model):
         """Copy all model weights into the existing engine; no rebuild/context."""
@@ -370,24 +413,39 @@ class TrtEngine:
             dtype = np.float16 if self.precision == "fp16" else np.float32
             refitter = self.trt.Refitter(self.engine, self.logger)
             keep = []
+            covered = set()
             for name in self.weight_names:
                 key = name[6:] if name.startswith("model.") else name
                 if key not in state:
                     raise RuntimeError("权重缺失: %s（模型结构变化？）" % name)
+                covered.add(key)
                 arr = np.ascontiguousarray(state[key], dtype=dtype)
                 weights = self.trt.Weights(arr)
                 keep.append((arr, weights))
                 if not refitter.set_named_weights(name, weights):
                     raise RuntimeError("TensorRT 拒绝权重: %s" % name)
-            missing = refitter.get_missing_weights()
-            if missing:
-                raise RuntimeError("refit 缺少权重: %s" % ", ".join(missing[:5]))
+            # 覆盖率自检：ONNX 导出会把重复的初始化器去重成别名，被折叠掉的那份
+            # 不会出现在 weight_names 里，refit 时静默跳过，永远停在建引擎那一刻
+            # 的值（导出副本还被 +1e-4 扰动过）。这里至少让它出现在日志里。
+            uncovered = [k for k, v in model.named_parameters()
+                         if v.ndim >= 2 and k not in covered]
+            if uncovered:
+                try:
+                    self.log("[TensorRT] 警告: %d 个权重未被 refit 覆盖（%s%s）"
+                             % (len(uncovered), ", ".join(uncovered[:4]),
+                                " ..." if len(uncovered) > 4 else ""))
+                except Exception:
+                    pass
+            # Do not call get_missing_weights() here: TensorRT 8.6's Python
+            # binding can raise UnicodeDecodeError while decoding its result
+            # even when every set_named_weights() call succeeded.  The boolean
+            # return of set_named_weights() is the authoritative check.
             if not refitter.refit_cuda_engine():
                 raise RuntimeError("refit_cuda_engine 失败")
             torch.cuda.synchronize()
             # `keep` must outlive refit_cuda_engine; it does (local scope).
 
-    def evaluate(self, states, legal_masks):
+    def evaluate(self, states, legal_masks, global_features=None):
         trt = self.trt
         with self.lock:
             b = int(states.shape[0])
@@ -398,15 +456,22 @@ class TrtEngine:
                         np.zeros((0,), np.float32))
             if b > self.batch:
                 raise ValueError("batch %d > 引擎上限 %d" % (b, self.batch))
+            if global_features is None:
+                global_features = np.zeros((b, self.global_dim), np.float32)
             with torch.inference_mode():
                 if self._current_b != b:
                     if self.context.set_binding_shape(
-                            self.input_idx,
+                            self.state_idx,
                             (b, self.input_channels, self.n, self.n)) is False:
-                        raise RuntimeError("set_binding_shape(%d) 失败" % b)
+                        raise RuntimeError("set_binding_shape(state,%d) 失败" % b)
+                    if self.context.set_binding_shape(
+                            self.global_idx, (b, self.global_dim)) is False:
+                        raise RuntimeError("set_binding_shape(globals,%d) 失败" % b)
                     self._current_b = b
-                self.input_t[:b].copy_(torch.from_numpy(
+                self.state_t[:b].copy_(torch.from_numpy(
                     np.ascontiguousarray(states, dtype=np.float32)))
+                self.global_t[:b].copy_(torch.from_numpy(
+                    np.ascontiguousarray(global_features, dtype=np.float32)))
                 bindings = [int(t["t"].data_ptr()) for t in self.tensors]
                 ok = self.context.execute_async_v2(
                     bindings=bindings,
@@ -423,8 +488,8 @@ class TrtEngine:
             logits -= logits.max(axis=1, keepdims=True)
             np.exp(logits, out=logits)
             logits /= logits.sum(axis=1, keepdims=True)
-            return logits, values.astype(np.float32, copy=False), \
-                wins.astype(np.float32, copy=False)
+            return (logits, values.astype(np.float32, copy=False),
+                    wins.astype(np.float32, copy=False))
 
 
 class TrtEvaluator:
@@ -439,12 +504,13 @@ class TrtEvaluator:
         self.n = int(board_size)
         self.max_batch = int(max_batch)
         self._active = True
+        self._fail_streak = 0
         self._lock = threading.Lock()
         self._log = log
 
-    def evaluate(self, states, legal_masks):
+    def evaluate(self, states, legal_masks, global_features=None):
         if not self._active:
-            return self._fallback.evaluate(states, legal_masks)
+            return self._fallback.evaluate(states, legal_masks, global_features)
         try:
             states = np.asarray(states, dtype=np.float32)
             legal_masks = np.asarray(legal_masks, dtype=np.float32)
@@ -452,40 +518,69 @@ class TrtEvaluator:
                 states = states[None, ...]
             if legal_masks.ndim == 1:
                 legal_masks = legal_masks[None, ...]
-            if states.shape[0] == 0:
+            b = states.shape[0]
+            if global_features is None:
+                global_features = np.zeros((b, self._engine.global_dim), np.float32)
+            else:
+                global_features = np.asarray(global_features, dtype=np.float32)
+                if global_features.ndim == 1:
+                    global_features = global_features[None, ...]
+            if b == 0:
                 total = self.n * self.n + 1
                 return (np.zeros((0, total), np.float32),
                         np.zeros((0,), np.float32),
                         np.zeros((0,), np.float32))
-            if states.shape[0] > self.max_batch:
-                ps, vs, ws = [], [], []
-                for i in range(0, states.shape[0], self.max_batch):
-                    p, v, w = self.evaluate(states[i:i + self.max_batch],
-                                            legal_masks[i:i + self.max_batch])
-                    ps.append(p); vs.append(v); ws.append(w)
+            if b > self.max_batch:
+                ps, vs, ws, ss = [], [], [], []
+                for i in range(0, b, self.max_batch):
+                    p, v, w, s = self.evaluate(states[i:i + self.max_batch],
+                                               legal_masks[i:i + self.max_batch],
+                                               global_features[i:i + self.max_batch])
+                    ps.append(p); vs.append(v); ws.append(w); ss.append(s)
                 return (np.concatenate(ps), np.concatenate(vs),
-                        np.concatenate(ws))
-            return self._engine.evaluate(states, legal_masks)
+                        np.concatenate(ws), np.concatenate(ss))
+            out = self._engine.evaluate(states, legal_masks, global_features)
+            self._fail_streak = 0
+            return out
         except Exception as exc:
             self._deactivate("推理失败: %s" % exc)
-            return self._fallback.evaluate(states, legal_masks)
+            return self._fallback.evaluate(states, legal_masks, global_features)
 
     def refit_from_model(self, model):
-        if not self._active:
-            return False
         try:
             self._engine.refit_from_model(model)
-            return True
         except Exception as exc:
             self._deactivate("refit 失败: %s" % exc)
             return False
+        # refit 成功说明引擎还活着，顺带把因失败而停用的 TRT 拉回来。
+        with self._lock:
+            self._fail_streak = 0
+            if not self._active:
+                self._active = True
+                try:
+                    self._log("[TensorRT] refit 成功，已恢复 TensorRT 推理")
+                except Exception:
+                    pass
+        return True
+
+    _MAX_FAIL_STREAK = 3
 
     def _deactivate(self, reason):
+        """记一次失败；连续失败到阈值才真正停用。
+
+        以前是「一次异常即永久停用」：一次瞬时 OOM 或单次形状抖动，就让整个
+        进程剩下的时间都在跑 PyTorch，而且不会自己恢复。现在单次失败只回退
+        这一次调用，连续 3 次才停用，之后每次 refit 都有机会恢复。
+        """
         with self._lock:
+            self._fail_streak += 1
+            if self._fail_streak < self._MAX_FAIL_STREAK:
+                return
             if self._active:
                 self._active = False
                 try:
-                    self._log("[TensorRT] %s；已自动回退 PyTorch" % reason)
+                    self._log("[TensorRT] %s（连续 %d 次）；已回退 PyTorch，"
+                              "下次 refit 会尝试恢复" % (reason, self._fail_streak))
                 except Exception:
                     pass
 

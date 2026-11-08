@@ -11,15 +11,14 @@
 import argparse
 import os
 import random
-import sys
 from datetime import datetime
 
 import torch
 
 from hyperparams import (BOARD_SIZE, BOARD_SIZES, KOMI, MODEL_PATH, NUM_SIMULATIONS,
-                         BATCH_SIZE_MCTS, C_PUCT, ALPHA, CANDIDATE_MASS,
-                         MIN_CANDIDATES, VIRTUAL_LOSS, MCTS_CAP,
-                         GUI_TEMPERATURE, validate_hollow, playable_area)
+                         BATCH_SIZE_MCTS, C_PUCT, ALPHA, VIRTUAL_LOSS, MCTS_CAP,
+                         GUI_TEMPERATURE)
+import shapes
 from game import GoGame, PASS_MOVE
 from model import PolicyValueNet
 from evaluator import GoEvaluator
@@ -43,14 +42,16 @@ def parse_args():
 
 示例：
   python play_headless.py --board-size 13
-  python play_headless.py --board-size 13 --hollow 7
+  python play_headless.py --board-size 14 --shape square:6
   python play_headless.py --black ai --white ai --games 3 --sims 100
-  python play_headless.py --board-size 13 --hollow 7 \
-      --black ai --white ai --games 1 --sgf hollow.sgf
+  python play_headless.py --board-size 13 --shape heart13 \
+      --black ai --white ai --games 1 --sgf heart.sgf
+
+形状：solid（默认）/ square:H（居中方块洞）/ ring / shapes/ 下的文件名。
 """)
     p.add_argument("--board-size", type=int, choices=BOARD_SIZES, default=BOARD_SIZE)
-    p.add_argument("--hollow", type=int, default=0,
-                   help="中心镂空边长（0=实心；3/5/7/9...，至少留两圈）")
+    p.add_argument("--shape", default="solid",
+                   help="棋盘形状：solid / square:H / ring / shapes/<名字>.txt")
     p.add_argument("--komi", type=float, default=KOMI)
     p.add_argument("--black", choices=("human", "ai"), default="human")
     p.add_argument("--white", choices=("human", "ai"), default="ai")
@@ -61,8 +62,6 @@ def parse_args():
     p.add_argument("--c-puct", type=float, default=C_PUCT)
     p.add_argument("--temperature", type=float, default=GUI_TEMPERATURE)
     p.add_argument("--alpha", type=float, default=ALPHA)
-    p.add_argument("--candidate-mass", type=float, default=CANDIDATE_MASS)
-    p.add_argument("--min-candidates", type=int, default=MIN_CANDIDATES)
     p.add_argument("--vloss", type=int, default=VIRTUAL_LOSS)
     p.add_argument("--dir-eps", type=float, default=0.0,
                    help="对弈默认 0，避免随机噪声")
@@ -161,11 +160,23 @@ def result_sgf(game):
     return "0"
 
 
-def write_sgf(path, game, moves, n, komi, hollow=0):
-    comment = "C[HOLLOW %dx%d]" % (hollow, hollow) if hollow else ""
+def write_sgf(path, game, moves, n, komi, hole_mask=None, start_stones=None):
+    comment = ""
+    setup = ""
+    if hole_mask is not None and hole_mask.any():
+        comment = "C[SHAPE %s]" % shapes.to_text(hole_mask).replace("\n", "|")
+    if start_stones is not None and start_stones.any():
+        ab = [sgf_coord((r, c))
+              for r in range(n) for c in range(n) if start_stones[r, c] == 1]
+        aw = [sgf_coord((r, c))
+              for r in range(n) for c in range(n) if start_stones[r, c] == -1]
+        if ab:
+            setup += "AB[%s]" % "][".join(ab)
+        if aw:
+            setup += "AW[%s]" % "][".join(aw)
     lines = ["(;GM[1]FF[4]CA[UTF-8]",
-             "SZ[%d]KM[%.1f]RU[Chinese]PB[Black]PW[White]DT[%s]%s"
-             % (n, komi, datetime.now().strftime("%Y-%m-%d"), comment),
+             "SZ[%d]KM[%.1f]RU[Chinese]PB[Black]PW[White]DT[%s]%s%s"
+             % (n, komi, datetime.now().strftime("%Y-%m-%d"), comment, setup),
              "RE[%s]" % result_sgf(game)]
     for color, (r, c) in moves:
         lines.append(";%s[%s]" % (color, sgf_coord((r, c))))
@@ -179,14 +190,15 @@ def write_sgf(path, game, moves, n, komi, hollow=0):
 
 def one_game(args, mcts):
     n = args.board_size
-    game = GoGame(n, komi=args.komi, hollow=args.hollow)
+    game = GoGame(n, komi=args.komi, hole_mask=args.hole_mask,
+                  start_board=args.start_stones)
     mcts.reset()
     moves = []   # (B/W, (r,c))
     humans = {1: args.black == "human", -1: args.white == "human"}
 
     print("=" * 60)
-    print("新对局: %d 路 | 镂空 %s | 贴目 %.1f | 黑=%s 白=%s"
-          % (n, ("%dx%d" % (args.hollow, args.hollow)) if args.hollow else "无",
+    print("新对局: %d 路 | 形状 %s | 可下 %d 点 | 贴目 %.1f | 黑=%s 白=%s"
+          % (n, args.shape, shapes.playable_area(args.hole_mask),
              args.komi, args.black, args.white))
     if not args.no_board:
         print_board(game)
@@ -252,21 +264,21 @@ def main():
         print("[warning] CUDA 不可用，改用 CPU", flush=True)
         args.device = "cpu"
     try:
-        args.hollow = validate_hollow(args.board_size, args.hollow)
-    except ValueError as exc:
-        raise SystemExit("--hollow 非法: %s" % exc)
+        args.hole_mask, args.start_stones = shapes.spec_from_name(
+            args.board_size, args.shape)
+    except (ValueError, OSError) as exc:
+        raise SystemExit("--shape 非法: %s" % exc)
     random.seed(args.seed)
 
     model = PolicyValueNet.load_model(args.model, device=args.device)
     evaluator = GoEvaluator(model, device=args.device, max_batch=args.mcts_batch)
-    area = playable_area(args.board_size, args.hollow)
+    area = shapes.playable_area(args.hole_mask)
     cap = max(MCTS_CAP, int(args.sims * area * 1.2))
     mcts = MCTS(
         evaluator=evaluator, num_simulations=args.sims,
         batch_size=args.mcts_batch, c_puct=args.c_puct,
         temperature=args.temperature, alpha=args.alpha,
         dirichlet_alpha=args.dir_alpha, dirichlet_epsilon=args.dir_eps,
-        candidate_mass=args.candidate_mass, min_candidates=args.min_candidates,
         board_size=args.board_size, virtual_loss=args.vloss, cap=cap)
 
     for gi in range(1, args.games + 1):
@@ -282,7 +294,7 @@ def main():
                 stem, ext = os.path.splitext(path)
                 path = "%s_%d%s" % (stem, gi, ext or ".sgf")
             write_sgf(path, game, moves, args.board_size, args.komi,
-                      args.hollow)
+                      args.hole_mask, args.start_stones)
             print("SGF 已保存: %s" % path)
 
 

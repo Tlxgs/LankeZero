@@ -8,25 +8,25 @@ from hyperparams import HOLE
 
 
 class GameBoard:
-    def __init__(self, canvas, board_size, cell_size, margin, hollow=0):
+    def __init__(self, canvas, board_size, cell_size, margin, hole_mask=None):
         self.canvas = canvas
         self.board_size = int(board_size)
         self.cell_size = cell_size
         self.margin = margin
         self.board_width = (board_size - 1) * cell_size
-        self.set_hollow(hollow)
+        self.set_hole(hole_mask)
 
-    def set_hollow(self, hollow):
-        self.hollow = int(hollow)
+    def set_hole(self, hole_mask):
+        """棋盘形状掩码（True = 洞）；None 表示整盘。"""
         n = self.board_size
-        h = self.hollow
-        self.hole_lo = (n - h) // 2 if h else n
-        self.hole_hi = self.hole_lo + h if h else n
+        self.hole_mask = (np.zeros((n, n), dtype=bool) if hole_mask is None
+                          else np.asarray(hole_mask, dtype=bool).reshape(n, n))
 
     def is_hole(self, row, col):
-        return (self.hollow > 0
-                and self.hole_lo <= row < self.hole_hi
-                and self.hole_lo <= col < self.hole_hi)
+        n = self.board_size
+        if not (0 <= row < n and 0 <= col < n):
+            return False
+        return bool(self.hole_mask[row, col])
 
     def draw_grid(self):
         for i in range(self.board_size):
@@ -40,28 +40,34 @@ class GameBoard:
         self.draw_hole()
 
     def draw_hole(self):
-        if not self.hollow:
+        """按格涂灰：心形、圆环、多个洞、贴边缺口都是同一段循环。"""
+        if not self.hole_mask.any():
             return
-        x0 = self.margin + (self.hole_lo - 0.5) * self.cell_size
-        y0 = self.margin + (self.hole_lo - 0.5) * self.cell_size
-        x1 = self.margin + (self.hole_hi - 0.5) * self.cell_size
-        y1 = self.margin + (self.hole_hi - 0.5) * self.cell_size
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill='#A9A9A9', outline='')
+        half = 0.5 * self.cell_size
+        for r, c in np.argwhere(self.hole_mask):
+            x = self.margin + int(c) * self.cell_size
+            y = self.margin + int(r) * self.cell_size
+            self.canvas.create_rectangle(x - half, y - half, x + half, y + half,
+                                         fill='#A9A9A9', outline='')
 
     def draw_stars(self):
-        """按棋盘大小生成星位；7/9/11 用二线，13+ 用三线。"""
+        """按棋盘大小生成星位；7/9/11 用二线，13+ 用三线。
+
+        偶数路没有天元（正中心根本没有交叉点），也不画边星 —— 只画四个角。
+        否则 (n-1)//2 会画出偏半格的一个点：既不是天元，也不在星位上。
+        """
         n = self.board_size
         if n < 7:
             return
         off = 2 if n <= 11 else 3
-        mid = (n - 1) // 2
         pts = [(off, off), (off, n - 1 - off),
                (n - 1 - off, off), (n - 1 - off, n - 1 - off)]
-        if n >= 7:
+        if n % 2 == 1:
+            mid = (n - 1) // 2
             pts.append((mid, mid))
-        if n >= 15:
-            pts.extend([(off, mid), (mid, off),
-                        (n - 1 - off, mid), (mid, n - 1 - off)])
+            if n >= 15:
+                pts.extend([(off, mid), (mid, off),
+                            (n - 1 - off, mid), (mid, n - 1 - off)])
         for r, c in dict.fromkeys(pts):
             if self.is_hole(r, c):
                 continue
@@ -86,7 +92,13 @@ class GameBoard:
         y = self.margin + row * self.cell_size
         return self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill='red', outline='red')
 
-    def draw_stat_circle(self, row, col, value, max_value, text):
+    def draw_stat_circle(self, row, col, value, text):
+        """在交叉点画统计圆；value 必须是已归一化到 0..1 的量。
+
+        归一化由调用方做：胜率本身就是 0..1，策略先验要先除以当前盘面最大先验
+        （否则 0.05~0.3 的先验全挤在色带同一端，棋盘上看不出热点）。
+        以前这里收了个 max_value 参数却从没用过，两种模式共用一套绝对映射。
+        """
         if self.is_hole(row, col):
             return None
         x = self.margin + col * self.cell_size
@@ -153,7 +165,7 @@ class TrainingStatsPanel:
         self.own_loss_label = tk.Label(row1, text="平均领地损失: --", font=('微软雅黑', 12))
         self.own_loss_label.pack(side=tk.LEFT, padx=5)
         
-        # 第二行：胜率损失 + 总损失
+        # 第二行：胜率损失 + 分数损失 + 总损失
         # 熵约束关闭后不再显示「熵损失」——它显示的是网络输出熵 H(q)，只有开正则时才有判断价值。
         row2 = tk.Frame(loss_frame)
         row2.pack(fill=tk.X)
@@ -172,8 +184,9 @@ class TrainingStatsPanel:
         self.stats_label.config(text=f"数据量: {data_size} 条 | 对局数: {game_count} | 训练Batch: {train_count}")
         self.lr_display_label.config(text=f"学习率: {lr:.6f}")
 
-    def update_loss(self, policy_loss, own_loss, entropy_loss, win_loss, total_loss):
-        """形参顺序即 SelfPlayTrainer.train_step 的返回顺序。
+    def update_loss(self, policy_loss, own_loss, entropy_loss, win_loss,
+                    total_loss):
+        """形参顺序即 SelfPlayTrainer.train_step 的返回顺序（分数头已删除）。
         entropy_loss 仍收下但不显示 —— 熵约束关闭后 H(q) 没有判断对象；
         要开正则时在这里加回一行即可。"""
         self.policy_loss_label.config(text=f"平均策略损失: {policy_loss:.4f}")

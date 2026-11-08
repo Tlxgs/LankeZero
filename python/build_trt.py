@@ -15,8 +15,6 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "python"))
 
-import torch  # noqa: E402
-
 from hyperparams import BOARD_SIZES, BATCH_SIZE_MCTS, MODEL_PATH  # noqa: E402
 from model import PolicyValueNet  # noqa: E402
 import trt_engine  # noqa: E402

@@ -10,7 +10,6 @@
 import argparse
 import os
 import random
-import sys
 import time
 import traceback
 from datetime import datetime
@@ -18,13 +17,13 @@ from datetime import datetime
 import numpy as np
 import torch
 
+import shapes
 from hyperparams import (BOARD_SIZES, NUM_SIMULATIONS, BATCH_SIZE, BATCH_SIZE_MCTS, C_PUCT,
                          ALPHA, VIRTUAL_LOSS, DIRICHLET_ALPHA, DIRICHLET_EPSILON,
-                         CANDIDATE_MASS, MIN_CANDIDATES, LEARNING_RATE,
+                         LEARNING_RATE,
                          WEIGHT_DECAY, OPTIMIZER_NAME, MOMENTUM, TRAIN_GAMES,
                          TRAIN_STEPS_PER_GAME, SAVE_INTERVAL, TRAINING_DATA_MAX,
-                         MODEL_PATH, LOG_DIR, PROJECT_ROOT, EXPLORATION_MODE,
-                         validate_hollow, playable_area)
+                         MODEL_PATH, LOG_DIR, PROJECT_ROOT, EXPLORATION_MODE)
 from model import PolicyValueNet, count_parameters
 from train import SelfPlayTrainer
 from mcts import MCTS
@@ -42,8 +41,8 @@ def build_parser():
   # 13 路自对弈 100 局，使用 data13/ 和 model.pt
   python train_headless.py --board-size 13 --games 100 --sims 300
 
-  # 13 路镂空 7×7 自对弈；混合数据仍写同一个 data13/
-  python train_headless.py --board-size 13 --hollow 7 --games 100
+  # 14 路、中心 6×6 方块洞（偶数盘配偶数洞才居中）；混合数据仍写同一个 data14/
+  python train_headless.py --board-size 14 --shape square:6 --games 100
 
   # 只训练已有数据，不生成新对局
   python train_headless.py --board-size 13 --train-only --train-batches 1000
@@ -62,8 +61,8 @@ def build_parser():
     # 对局 / 搜索
     g = p.add_argument_group("对局与搜索")
     g.add_argument("--board-size", type=int, choices=BOARD_SIZES, default=13)
-    g.add_argument("--hollow", type=int, default=0,
-                   help="中心镂空边长（0=实心；3/5/7/9...，至少留两圈）")
+    g.add_argument("--shape", default="solid",
+                   help="棋盘形状：solid / square:H / shapes/<名字>.txt")
     g.add_argument("--games", type=int, default=TRAIN_GAMES,
                    help="自对弈完成的局数")
     g.add_argument("--sims", type=int, default=NUM_SIMULATIONS,
@@ -71,16 +70,16 @@ def build_parser():
     g.add_argument("--mcts-batch", type=int, default=BATCH_SIZE_MCTS)
     g.add_argument("--c-puct", type=float, default=C_PUCT)
     g.add_argument("--temperature", type=float, default=0.5)
+    g.add_argument("--komi", type=float, default=None,
+                   help="每局贴目（默认 hyperparams.KOMI）；让子开局固定贴 0 目")
     g.add_argument("--alpha", type=float, default=ALPHA,
                    help="胜率/目差混合系数，0=纯胜率，1=纯目差")
     g.add_argument("--vloss", type=int, default=VIRTUAL_LOSS)
     g.add_argument("--dir-alpha", type=float, default=DIRICHLET_ALPHA)
     g.add_argument("--dir-eps", type=float, default=DIRICHLET_EPSILON)
-    g.add_argument("--candidate-mass", type=float, default=CANDIDATE_MASS)
-    g.add_argument("--min-candidates", type=int, default=MIN_CANDIDATES)
     g.add_argument("--exploration", dest="exploration", action="store_true",
                    default=EXPLORATION_MODE,
-                   help="四角随机开局（hollow>0 时自动关闭）")
+                   help="让子开局：13 路以上黑先摆 1~4 个角星位，贴 0 目（有洞的棋盘自动关闭）")
     g.add_argument("--no-exploration", dest="exploration", action="store_false")
 
     # 数据 / 模型
@@ -158,9 +157,10 @@ def _validate(args):
     if args.board_size not in BOARD_SIZES:
         raise SystemExit("--board-size 只能是 %s" % (BOARD_SIZES,))
     try:
-        args.hollow = validate_hollow(args.board_size, args.hollow)
-    except ValueError as exc:
-        raise SystemExit("--hollow 非法: %s" % exc)
+        args.hole_mask, args.start_stones = shapes.spec_from_name(
+            args.board_size, args.shape)
+    except (ValueError, OSError) as exc:
+        raise SystemExit("--shape 非法: %s" % exc)
     if args.batch <= 0:
         raise SystemExit("--batch 必须 > 0")
     if args.max_data < args.batch:
@@ -171,10 +171,6 @@ def _validate(args):
         raise SystemExit("--mcts-batch 必须 > 0")
     if not (0.0 <= args.alpha <= 1.0):
         raise SystemExit("--alpha 必须在 [0, 1] 内")
-    if not (0.0 <= args.candidate_mass <= 1.0):
-        raise SystemExit("--candidate-mass 必须在 [0, 1] 内")
-    if args.min_candidates <= 0:
-        raise SystemExit("--min-candidates 必须 > 0")
     if args.save_interval < 0:
         raise SystemExit("--save-interval 不能为负数")
     if args.train_only:
@@ -227,15 +223,13 @@ def main():
     try:
         logger("=" * 60)
         logger("headless 训练开始")
-        logger("board=%d hollow=%d area=%d games=%d sims=%d temp=%.2f alpha=%.2f dir=%.3f/%.2f "
-               "cand=%.3f/%d"
-               % (args.board_size, args.hollow,
-                  playable_area(args.board_size, args.hollow),
+        logger("board=%d shape=%s area=%d games=%d sims=%d temp=%.2f alpha=%.2f dir=%.3f/%.2f"
+               % (args.board_size, args.shape,
+                  shapes.playable_area(args.hole_mask),
                   args.games, args.sims, args.temperature,
-                  args.alpha, args.dir_alpha, args.dir_eps,
-                  args.candidate_mass, args.min_candidates))
-        if args.hollow and args.exploration and not args.train_only:
-            logger("提示: hollow>0 时四角固定开局自动关闭，避免开局落进洞里")
+                  args.alpha, args.dir_alpha, args.dir_eps))
+        if args.hole_mask.any() and args.exploration and not args.train_only:
+            logger("提示: 棋盘有洞时让子开局自动关闭，避免落进洞里")
         logger("model=%s data=%s device=%s batch=%d steps=%d lr=%g"
                % (args.model, args.data_dir, args.device, args.batch,
                   args.steps, args.lr))
@@ -309,7 +303,6 @@ def _make_mcts(trainer, args):
         batch_size=args.mcts_batch, c_puct=args.c_puct,
         temperature=args.temperature, alpha=args.alpha,
         dirichlet_alpha=args.dir_alpha, dirichlet_epsilon=args.dir_eps,
-        candidate_mass=args.candidate_mass, min_candidates=args.min_candidates,
         board_size=args.board_size, virtual_loss=args.vloss)
 
 
@@ -333,7 +326,8 @@ def _selfplay(trainer, args, logger):
             mcts=mcts, board_size=args.board_size, num_simulations=args.sims,
             device=args.device, c_puct=args.c_puct,
             temperature=args.temperature, exploration=args.exploration,
-            on_move=on_move, hollow=args.hollow)
+            on_move=on_move, hole_mask=args.hole_mask, komi=args.komi,
+            start_stones=args.start_stones)
         if result["payload"] is None or not result["complete"]:
             logger("自对弈未正常结束，丢弃本局（%d/%d）" % (attempts, max_attempts))
             continue

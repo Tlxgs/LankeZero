@@ -1,25 +1,27 @@
 """本机单进程训练：SelfPlayTrainer + 紧凑回放 + 唯一 model.pt。
 
-旧 pkl / ONNX / 多 worker 训练路径已归档到 legacy/server。
-训练只加载当前 10 通道架构（旧 9 通道自动小初始化迁移）；全项目只有一个权重 model.pt，保存时原地原子覆盖。
+训练只加载当前 KataGo-lite 架构（空间 11 通道 + 6 维全局；旧架构明确拒绝）；
+全项目只有一个权重 model.pt，保存时原地原子覆盖。
 """
+import copy
 import os
-import random
+import threading
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from hyperparams import (BOARD_SIZE, NUM_SIMULATIONS, C_PUCT, BATCH_SIZE,
-                         GRAD_ACCUM_STEPS, LEARNING_RATE, EYE_LR, GPOOL_LR,
-                         CH_OWN_EYES, CH_OPP_EYES, CH_BOUNDARY,
+                         GRAD_ACCUM_STEPS, LEARNING_RATE, GPOOL_LR,
                          WEIGHT_DECAY, MOMENTUM,
                          OPTIMIZER_NAME, WARMUP_STEPS, ENTROPY_TARGET,
-                         ENTROPY_HINGE_WEIGHT, OWN_WEIGHT, WIN_WEIGHT,
+                         ENTROPY_HINGE_WEIGHT, OWN_WEIGHT, WIN_WEIGHT, GLOBAL_LR,
                          GRAD_CLIP_NORM, DATA_DIR, MODEL_PATH, TRAINING_DATA_MAX,
-                         PYTORCH_CUDA_ALLOC_CONF, MCTS_CAP, BATCH_SIZE_MCTS)
+                         PYTORCH_CUDA_ALLOC_CONF, BATCH_SIZE_MCTS,
+                         EMA_ENABLED, EMA_DECAY)
 from model import PolicyValueNet, GlobalPoolBias
 from replay import TrainingData
+from rules_adapter import GO_RULES
 from trt_engine import make_evaluator
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", PYTORCH_CUDA_ALLOC_CONF)
@@ -38,9 +40,10 @@ class SelfPlayTrainer:
                  optimizer_name=OPTIMIZER_NAME, momentum=MOMENTUM,
                  freeze_parts=None, reset_norm=False, data_max=None,
                  evaluator=None, use_tensorrt=False, trt_engine_dir=None,
-                 log=None):
+                 log=None, rules=None):
         self.board_size = board_size
         self.device = device
+        self.rules = rules or GO_RULES
         self.num_simulations = num_simulations
         self.data_dir = data_dir
         self.c_puct = c_puct
@@ -60,18 +63,24 @@ class SelfPlayTrainer:
             self.frozen_params_count = self.model.freeze_parts(freeze_parts)
             print("[训练] 冻结参数: %s（%d 个参数）" % (freeze_parts, self.frozen_params_count))
         self.data_buffer = TrainingData(max_size=data_max or TRAINING_DATA_MAX,
-                                        data_dir=data_dir, board_size=board_size)
+                                        data_dir=data_dir, board_size=board_size,
+                                        encoder=getattr(self.rules, "encoder", None))
         self.optimizer = self._build_optimizer()
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=lambda epoch: 1.0)
+        self._save_lock = threading.Lock()
         self.game_count = 0
         self.train_count = 0
         self.warmup_steps = WARMUP_STEPS
         self.grad_accum_steps = max(1, int(GRAD_ACCUM_STEPS))
         self._accum_steps_done = 0
         self._opt_steps = 0
+        # EMA：自对弈与保存都用这份滑动平均权重；self.model 只用于训练。
+        # 两者参数顺序一致（deepcopy），逐元素原地更新，所以推理器/TRT 的
+        # 指针一直有效，不需要重建。
+        self.ema = copy.deepcopy(self.model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
         self.evaluator = evaluator or make_evaluator(
-            self.model, board_size=board_size, device=device,
+            self.ema, board_size=board_size, device=device,
             max_batch=BATCH_SIZE_MCTS, use_tensorrt=self.use_tensorrt,
             trt_engine_dir=trt_engine_dir, log=self._log)
 
@@ -146,24 +155,29 @@ class SelfPlayTrainer:
 
     @staticmethod
     def _ownership_loss_mask(own_target, own_mask, valid):
-        """归属损失的样本掩码。
+        """归属损失的样本掩码：**所有格子都参与**。
 
-        可落子点（valid=True）只训练非 0 标签，中立空点不强行给 0；
-        洞（valid=False）也纳入损失，目标固定为 0，让归属头学会输出 0。
+        可落子点按标签训练（目标 0 的中立/单官点也参与，让归属头学会在这些点输出 0）；
+        洞（valid=False）同样纳入，目标固定为 0。
+        实测（13/14/19 路末段）中立点长期没有梯度，模型在单官/中立区平均输出 |0.8~0.9|，
+        19 路每局约 6 个中立点、每手能贡献 ~5 目目差误差，所以必须监督。
         """
-        return own_mask & (((own_target != 0) & valid) | (~valid))
+        return own_mask.expand_as(own_target)
 
     def train_step(self, batch_size=BATCH_SIZE):
         if len(self.data_buffer) < batch_size:
             return (None,) * self.LOSS_N
-        states, policies, values, ownerships, _kos, own_masks = self.data_buffer.sample(batch_size)
+        states, globals_, policies, values, ownerships, own_masks = \
+            self.data_buffer.sample(batch_size)
         states, policies, values, ownerships, own_masks = self._augment_batch(
             states, policies, values, ownerships, own_masks, self.board_size)
         states_t = torch.from_numpy(states).to(self.device)
+        globals_t = torch.from_numpy(globals_).to(self.device)
         policies_t = torch.from_numpy(policies).to(self.device)
 
         self.model.train()
-        policy_logits, pred_values, own_logits, win_logits = self.model(states_t)
+        policy_logits, pred_values, own_logits, win_logits = \
+            self.model(states_t, globals_t)
         log_probs = F.log_softmax(policy_logits, dim=1)
         policy_loss = -(policies_t * log_probs).sum(dim=1).mean()
         probs = F.softmax(policy_logits, dim=1)
@@ -173,7 +187,8 @@ class SelfPlayTrainer:
         own_target = torch.from_numpy(ownerships).to(self.device).float()
         own_mask = torch.from_numpy(own_masks).to(self.device).bool().view(-1, 1, 1)
         # 边界通道 -1 = 洞。可落子点只训练非 0 标签；洞内也参与损失，目标 0。
-        valid = torch.from_numpy(states[:, CH_BOUNDARY] >= 0.0).to(self.device).bool()
+        valid = torch.from_numpy(
+            states[:, self.model.boundary_channel] >= 0.0).to(self.device).bool()
         mask = self._ownership_loss_mask(own_target, own_mask, valid)
         if not mask.any():
             own_loss = torch.zeros((), device=self.device)
@@ -186,34 +201,31 @@ class SelfPlayTrainer:
 
         win_target = (torch.from_numpy(values).to(self.device).float() + 1.0) / 2.0
         win_loss = F.binary_cross_entropy_with_logits(2.0 * win_logits.squeeze(1), win_target)
+
+        # 目差信号由归属头逐点求和承担（分数头已删除）。
         excess = (entropy - ENTROPY_TARGET).clamp(min=0.0)
         entropy_penalty = ENTROPY_HINGE_WEIGHT * excess * excess
-        total_loss = policy_loss + entropy_penalty + OWN_WEIGHT * own_loss + WIN_WEIGHT * win_loss
+        total_loss = (policy_loss + entropy_penalty + OWN_WEIGHT * own_loss
+                      + WIN_WEIGHT * win_loss)
 
         if self._accum_steps_done == 0:
             self.optimizer.zero_grad()
         (total_loss / self.grad_accum_steps).backward()
         self._accum_steps_done += 1
         if self._accum_steps_done >= self.grad_accum_steps:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
-            self._boost_eye_grads()
-            self._boost_gpool_grads()
-            self.optimizer.step()
-            self._accum_steps_done = 0
             self._opt_steps += 1
+            # warmup 必须在 step 之前改 lr：放在 step 之后，第一次更新就会直接
+            # 吃满学习率 —— 而 warmup 要避开的恰恰是这一步。
             self._apply_warmup()
+            # 放大也要在裁剪之前：先裁后放大等于这两类参数完全绕过 GRAD_CLIP_NORM。
+            self._boost_gpool_grads()
+            self._boost_global_grads()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
+            self.optimizer.step()
+            self._update_ema()
+            self._accum_steps_done = 0
         return (policy_loss.item(), own_loss.item(), entropy.item(),
                 win_loss.item(), total_loss.item())
-
-    def _boost_eye_grads(self):
-        if EYE_LR <= 0 or self.learning_rate <= 0:
-            return
-        w = self.model.conv_input.weight
-        if w.grad is None:
-            return
-        mult = EYE_LR / self.learning_rate
-        w.grad[:, CH_OWN_EYES] *= mult
-        w.grad[:, CH_OPP_EYES] *= mult
 
     def _boost_gpool_grads(self):
         if GPOOL_LR <= 0 or self.learning_rate <= 0:
@@ -226,6 +238,24 @@ class SelfPlayTrainer:
                 if p.grad is not None:
                     p.grad *= mult
 
+    def _boost_global_grads(self):
+        """只放大「新增的全局特征列」的梯度，贴目列保持原学习率。
+
+        ``global_bias.fc1.weight`` 的形状是 (hidden, GLOBAL_DIM)，第 0 列是贴目，
+        后面几列是棋子数/提子数。后几列是从零附近起步的新参数，和训了很久的
+        贴目列共用一份梯度会严重吃亏，所以按 GLOBAL_LR 单独放大。
+        """
+        if GLOBAL_LR <= 0 or self.learning_rate <= 0:
+            return
+        mult = GLOBAL_LR / self.learning_rate
+        w = self.model.global_bias.fc1.weight
+        if w.grad is not None and w.grad.shape[1] > 1:
+            w.grad[:, 1:] *= mult
+        # 直连残差整条都是新参数（全零初始化），每一列都要放大
+        sk = getattr(self.model, "global_skip", None)
+        if sk is not None and sk.weight.grad is not None:
+            sk.weight.grad *= mult
+
     def _apply_warmup(self):
         if self.warmup_steps > 0 and self._opt_steps <= self.warmup_steps:
             scale = self._opt_steps / self.warmup_steps
@@ -233,17 +263,43 @@ class SelfPlayTrainer:
                 g["lr"] = self.learning_rate * scale
 
     def flush_grad_accum(self):
-        if getattr(self, "_accum_steps_done", 0) > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
-            self._boost_eye_grads()
-            self._boost_gpool_grads()
-            self.optimizer.step()
-            self._accum_steps_done = 0
-            self._opt_steps += 1
-            self._apply_warmup()
+        """把半截梯度累积兑现成一次更新（收尾 / 保存前 / 异常中断时调用）。
+
+        梯度在 backward 时已按 1/GRAD_ACCUM_STEPS 归一化，只累积了 k<N 个
+        micro-batch 时等效步长会缩到 k/N。这里把梯度乘回 N/k 再 step，
+        让「不足一次累积」的那步和正常步同量级。
+        """
+        done = getattr(self, "_accum_steps_done", 0)
+        if done <= 0:
+            return
+        mult = max(1, int(self.grad_accum_steps)) / float(done)
+        for p in self.model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(mult)
+        self._opt_steps += 1
+        self._apply_warmup()
+        self._boost_gpool_grads()
+        self._boost_global_grads()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
+        self.optimizer.step()
+        self._update_ema()
+        self._accum_steps_done = 0
+
+    def _update_ema(self):
+        """把刚更新过的原始权重混进 EMA（原地，不新建张量）。
+
+        常数衰减：ema = d*ema + (1-d)*raw，d = EMA_DECAY（默认 0.9）。
+        EMA_ENABLED=0 时 d=0，EMA 恒等于原始权重（关掉也不会改变任何调用路径）。
+        """
+        decay = float(EMA_DECAY) if EMA_ENABLED else 0.0
+        with torch.no_grad():
+            for e, p in zip(self.ema.parameters(), self.model.parameters()):
+                e.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+            for e, p in zip(self.ema.buffers(), self.model.buffers()):
+                e.copy_(p)
 
     def save_model(self, tag=None):
-        """原地原子更新唯一的 model.pt。
+        """原地原子更新唯一的 model.pt（写的是 EMA 权重）。
 
         tag 只保留给旧调用方；不再生成任何新权重文件。先写 .tmp 再 os.replace，
         保存过程中崩溃也不会留下半截 model.pt。
@@ -251,11 +307,15 @@ class SelfPlayTrainer:
         """
         path = self.model_path
         tmp = path + ".tmp"
-        self.model.save_model(tmp)
-        os.replace(tmp, path)
-        self.last_saved = path
-        torch.cuda.empty_cache()
-        self._refit_tensorrt()
+        # 手动保存（UI 线程）和周期保存（训练线程）都会走到这里，两者共用同一个
+        # model.pt.tmp：并发写会让 os.replace 后的文件变成两段字节流交错，
+        # 之后 torch.load 直接读不出来。这里串行化整段「写临时文件 + 替换」。
+        with self._save_lock:
+            self.ema.save_model(tmp)       # 落盘的是 EMA，不是刚更新完的原始权重
+            os.replace(tmp, path)
+            self.last_saved = path
+            torch.cuda.empty_cache()
+            self._refit_tensorrt()
         return path
 
     def _refit_tensorrt(self):
@@ -263,7 +323,7 @@ class SelfPlayTrainer:
         if ev is None or not hasattr(ev, "refit_from_model"):
             return
         try:
-            ev.refit_from_model(self.model)
+            ev.refit_from_model(self.ema)
         except Exception as exc:
             self._log("[TensorRT] refit 异常: %s" % exc)
 
@@ -295,8 +355,6 @@ class SelfPlayTrainer:
         if rebuild:
             self.flush_grad_accum()
             self.optimizer = self._build_optimizer()
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer, lr_lambda=lambda epoch: 1.0)
         if "c_puct" in kwargs:
             self.c_puct = kwargs["c_puct"]
         if "num_simulations" in kwargs:

@@ -1,62 +1,49 @@
 # 烂柯 Zero
 
-AlphaZero 风格的围棋引擎：全卷积策略/价值网络配合 MCTS 自对弈训练，提供本机对弈界面和无界面训练/对弈入口。
+本目录是「烂柯 Zero」的 Python 实现：一个在本机运行的 AlphaZero 式围棋引擎，
+**全卷积神经网络 + MCTS + 自对弈训练**。
+**支持任意尺寸、任意形状（如心形、中间镂空等）、任意开局**
 
 ## 特性
 
-- 一套权重支持多种棋盘尺寸和中心镂空棋盘。
-- 完整围棋规则：自杀禁手、位置超级劫、终局计分与归属。
-- AlphaZero 式训练：MCTS 自对弈、访问计数策略目标、归属/胜率辅助头、数据增强。
-- 本机单进程运行，练习、对弈和训练都在本机完成。
-- Tk 对弈界面和训练界面，训练参数可调，支持回放与手动修正策略标签。
-- 可选 TensorRT 推理加速；不可用或引擎不匹配时自动回退 PyTorch。
+- **一份权重支持任意尺寸棋盘**，也支持镂空棋盘（心形、圆环、自定义形状），
+  不需要按尺寸分别训练。
+- **三个头**：策略、归属、胜率；
+  归属头逐点求和就是目差估计。
+- **自己练**：自对弈产生对局 → MCTS 访问计数当策略标签 → 训练 → 再自对弈；
+  也能导入人类棋谱。
+- **完整规则**：禁自杀、禁全同、终局计分与归属、让子局、任意贴目。
+- **两种界面**：对弈界面（人人 / 人机 / 双 AI）和训练界面（自对弈 + 训练 + 回放 + 手动标注）。
+- **可选 TensorRT**：有匹配的引擎就用 REFIT 推理，没有或结构不匹配自动回退 PyTorch。
 
-## 快速开始
+## 安装
 
-需要 Python 3.8+ 和 PyTorch；训练建议使用 CUDA 显卡。
+需要 Python 3.8+、PyTorch(需要Nvidia显卡，CPU训练较慢不推荐)。
 
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Linux/macOS: source .venv/bin/activate
-
-pip install -r python/requirements.txt
-python python/gui.py        # 对弈界面
-python python/train_gui.py  # 训练界面
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r python\requirements.txt
+:: torch 请按你的 CUDA 版本安装，例如 cu124：
+pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
 
-仓库包含唯一训练权重 `model.pt`，训练时会原地原子更新。
+## 运行
 
-也可以不打开界面，直接跑无界面训练或对弈：
+在本目录下直接执行（源码都在 `python\` 下）：
 
-```bash
-python python/train_headless.py --help
-python python/play_headless.py --help
+```bat
+python python\gui.py            :: 对弈界面
+python python\train_gui.py      :: 训练界面
+python python\train_headless.py --help     :: 无界面训练
+python python\play_headless.py  --help     :: 无界面对弈
+python python\bench.py --sims 300 --batch 16
 ```
 
-## 目录
+需要一个权重文件；路径由 `--model` 指定（默认本目录的 `model.pt`）。
+本仓库附带一个经过一定训练的权重，该模型结构是10个残差块、128通道。主要在13路棋盘上训练，因此在其他大小棋盘上可能水平相对较低。棋力仅供参考，不代表该参数量下最强水平。
 
-```text
-python/
-  game.py           规则、位置超级劫、终局与输入编码
-  model.py          CNN 策略/归属/胜率网络
-  mcts.py           MCTS
-  selfplay.py       自对弈
-  replay.py         训练数据与回放
-  train.py          训练循环
-  trt_engine.py     可选 TensorRT 后端（自动回退）
-  build_trt.py      TensorRT 引擎缓存构建
-  train_headless.py 无界面训练入口
-  play_headless.py  无界面对弈入口
-  gui.py            对弈界面
-  train_gui.py      训练界面
-  tests/            单元测试
-model.pt            唯一训练权重
-README.md
-```
-
-## 测试
-
-```bash
-python python/tests/test_core.py
+没有权重就从零开始：
+```bat
+python python\train_headless.py --init-model --channels 128 --blocks 10 --board-size 13 --games 1000
 ```

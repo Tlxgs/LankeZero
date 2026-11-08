@@ -3,40 +3,57 @@
 """
 import numpy as np
 from numba import njit
+
+import shapes
 from hyperparams import (BOARD_SIZE, KOMI, PASS_MOVE, HOLE, MAX_BOARD_CELLS,
-                         board_rules, validate_hollow, PRUNE_DEAD_LUMPS,
-                         INPUT_CHANNELS,
-                         CH_OWN_STONES, CH_OPP_STONES, CH_LAST_MOVE, CH_KOMI,
+                         board_rules_for_area, validate_komi,
+                         PRUNE_DEAD_LUMPS,
+                         INPUT_CHANNELS, GLOBAL_DIM, G_KOMI, KOMI_SCALE,
+                         G_OWN_STONES, G_OPP_STONES, G_OWN_CAPS, G_OPP_CAPS, G_AREA,
+                         CH_OWN_STONES, CH_OPP_STONES, CH_LAST_MOVE,
                          CH_OWN_URGENCY, CH_OPP_URGENCY, CH_LEGAL_MASK,
-                         CH_OWN_EYES, CH_OPP_EYES, CH_BOUNDARY)
+                         CH_BOUNDARY,
+                         CH_OWN_LADDER, CH_OPP_LADDER,
+                         CH_OWN_ALIVE, CH_OPP_ALIVE)
 
 
-def boundary_plane(board_size, hollow=0):
-    """生成边界输入通道：洞内 -1、内外边界 +1、其余可落子点 0。
+def boundary_plane_from_mask(hole):
+    """由形状掩码生成边界输入通道：洞内 -1、边界 +1、其余可落子点 0。
 
-    13 路镂空 7×7 时：中心 7×7=-1，9×9 最外圈=+1，13×13 最外圈=+1，
-    其余可落子点=0。hollow=0 时退化为「最外圈 1、内部 0」。
+    规则与旧的「居中方块洞」版逐点一致：
+    - 盘外边界只取最外圈（4 邻域语义，实心盘的编码一点不变）；
+    - 洞的外轮廓取 8 邻域 —— 旧版画的是「hollow+2 空心矩形的最外圈」，
+      包含四个对角点，等价于切比雪夫距离 1 的一圈。
+
+    换成掩码之后，心形、圆环、多个洞、贴边缺口都走同一条路径。
     """
-    n = int(board_size)
-    h = validate_hollow(n, hollow)
+    hole = np.asarray(hole, dtype=bool)
+    n = hole.shape[0]
     out = np.zeros((n, n), dtype=np.float32)
+    if hole.any():
+        pad = np.pad(hole, 1, constant_values=False)
+        near = np.zeros((n, n), dtype=bool)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr or dc:
+                    near |= pad[1 + dr:1 + dr + n, 1 + dc:1 + dc + n]
+        out[~hole & near] = 1.0
     out[0, :] = 1.0
     out[-1, :] = 1.0
     out[:, 0] = 1.0
     out[:, -1] = 1.0
-    if h:
-        lo = (n - h) // 2
-        hi = lo + h
-        out[lo:hi, lo:hi] = -1.0
-        # 洞外一圈：hollow+2 尺寸的空心矩形的最外圈。
-        out[lo - 1, lo - 1:hi + 1] = 1.0
-        out[hi, lo - 1:hi + 1] = 1.0
-        out[lo - 1:hi + 1, lo - 1] = 1.0
-        out[lo - 1:hi + 1, hi] = 1.0
+    out[hole] = -1.0            # 洞贴着盘边时，别被最外圈覆盖
     return out
 
-# Zobrist 表：用于「全历史局面」精确比对（位置超级劫），
-# 同时保留上一局面哈希以兼容旧接口。
+
+def boundary_plane(board_size, hole_mask=None):
+    """兼容入口：给掩码就按掩码画，不给就是实心盘。"""
+    n = int(board_size)
+    if hole_mask is None:
+        return boundary_plane_from_mask(np.zeros((n, n), dtype=bool))
+    return boundary_plane_from_mask(shapes.validate_mask(hole_mask, n))
+
+# Zobrist 表：用于「全历史局面」精确比对（位置超级劫）。
 # 颜色下标 0=黑、1=白；扁平下标 r*n+c，覆盖当前支持的最大棋盘。
 _ZOBRIST = np.random.RandomState(0x5EED).randint(
     1, 2**63 - 1, size=(2, MAX_BOARD_CELLS), dtype=np.uint64)
@@ -45,20 +62,15 @@ _MASK32 = np.uint64(0xFFFFFFFF)
 
 @njit(cache=True)
 def _hash_from_slots(st):
-    """从 _st[13:15] 取当前局面哈希，_st[15:17] 取上一局面哈希。"""
-    cur = ((np.uint64(st[13]) & _MASK32)
-           | ((np.uint64(st[14]) & _MASK32) << np.uint64(32)))
-    prev = ((np.uint64(st[15]) & _MASK32)
-            | ((np.uint64(st[16]) & _MASK32) << np.uint64(32)))
-    return cur, prev
+    """从 _st[8:10] 取当前局面哈希。"""
+    return ((np.uint64(st[8]) & _MASK32)
+            | ((np.uint64(st[9]) & _MASK32) << np.uint64(32)))
 
 
 @njit(cache=True)
-def _set_hash_slots(st, cur, prev):
-    st[13] = np.int32(cur & _MASK32)
-    st[14] = np.int32((cur >> np.uint64(32)) & _MASK32)
-    st[15] = np.int32(prev & _MASK32)
-    st[16] = np.int32((prev >> np.uint64(32)) & _MASK32)
+def _set_hash_slots(st, cur):
+    st[8] = np.int32(cur & _MASK32)
+    st[9] = np.int32((cur >> np.uint64(32)) & _MASK32)
 
 
 @njit(cache=True)
@@ -80,12 +92,12 @@ def _sync_history(st, hist, cur_h):
     手工改棋盘/直接写 _st 的调用方（测试、SGF 导入等）会被顺带补上，
     因此全历史判定对旧接口仍然成立。
     """
-    hist_n = st[17]
+    hist_n = st[10]
     if hist_n <= 0 or hist[hist_n - 1] != cur_h:
         if hist_n < hist.shape[0]:
             hist[hist_n] = cur_h
             hist_n += 1
-            st[17] = hist_n
+            st[10] = hist_n
     return hist_n
 
 
@@ -207,13 +219,12 @@ def _capture_opponent(board, row, col, player, n, cap):
     return count
 
 @njit(cache=True)
-def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h,
-                   use_hash, n, hist, hist_n):
+def _is_legal_impl(board, row, col, player, cur_h, n, hist, hist_n):
     """等价 Python _is_legal_move（临时落子后恢复，不污染棋盘）。
 
-    use_hash=True 时，用「落子后的局面哈希」与全历史比对判位置超级劫；
-    没有历史状态的调用方（_legal_mask_for 的 D4 增强）仍用旧 ko 点判据。
-    非提子着法不可能重现旧局面，因此只在 captured>0 时查历史。
+    用「落子后的局面哈希」与全历史比对判位置超级劫（位置超级劫已覆盖普通劫，
+    所以不需要另外的劫点判据）。非提子着法不可能重现旧局面，因此只在 captured>0
+    时查历史。
     """
     if board[row, col] != 0:
         return False
@@ -222,19 +233,13 @@ def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h,
     captured = _capture_opponent(board, row, col, player, n, cap)
     board[row, col] = 0
     if captured > 0:
-        if use_hash:
-            ci = 0 if player == 1 else 1
-            opp = 1 - ci
-            h = cur_h ^ _ZOBRIST[ci, row * n + col]
-            for j in range(captured):
-                h ^= _ZOBRIST[opp, cap[j]]
-            if hist_n > 0:
-                if _history_contains(hist, hist_n, h):
-                    return False                  # 重现历史局面 = 超级劫
-            elif h == prev_h:
-                return False
-        elif ko_r != -2 and row == ko_r and col == ko_c:
-            return False                          # 无历史状态时的旧兼容判据
+        ci = 0 if player == 1 else 1
+        opp = 1 - ci
+        h = cur_h ^ _ZOBRIST[ci, row * n + col]
+        for j in range(captured):
+            h ^= _ZOBRIST[opp, cap[j]]
+        if hist_n > 0 and _history_contains(hist, hist_n, h):
+            return False                          # 重现历史局面 = 超级劫
     if captured == 0:
         board[row, col] = player
         ok = _group_has_liberty(board, row, col, n)
@@ -242,33 +247,50 @@ def _is_legal_impl(board, row, col, player, ko_r, ko_c, cur_h, prev_h,
         return ok                                 # 自杀判定
     return True
 
+
+def position_legal_mask(board, player, n):
+    """不含超级劫的合法性掩码（只看提子/自杀），供界面手动标注旧数据用。
+
+    旧 npz 的 `legals` 掩码可能带着已废弃的「pass 上限」限制（达到上限时落子全禁），
+    标注重算时不能直接信它。`board` 用行棋方视角（+1 = 行棋方棋子）。
+    """
+    board = np.asarray(board, dtype=np.int8)
+    n = int(n)
+    player = int(player)
+    out = np.zeros((n, n), dtype=bool)
+    cap = np.zeros(n * n, dtype=np.int32)
+    for r in range(n):
+        for c in range(n):
+            if board[r, c] != 0:
+                continue
+            b = board.copy()
+            b[r, c] = player
+            captured = int(_capture_opponent(b, r, c, player, n, cap))
+            for j in range(captured):
+                b[int(cap[j]) // n, int(cap[j]) % n] = 0
+            out[r, c] = bool(_group_has_liberty(b, r, c, n))
+    return out
+
 @njit(cache=True)
 def _make_move(board, st, go, fp, row, col, cap, hist):
     """落子（含 Pass/提子/超级劫检测），非法超级劫着法会回滚并返回 False。
-    st: [0]当前玩家 [1]上一步r [2]上一步c [3]劫r [4]劫c
-        [5]步数 [6]连续pass [7]黑总pass [8]白总pass [9]winner(-2=None)
-        [10]min_moves [11]max_moves [12]pass_limit
-        [13:15]当前局面 Zobrist 哈希 [15:17]上一局面哈希
-        [17]历史局面条数。
+    st: [0]当前玩家 [1]上一步r [2]上一步c
+        [3]步数 [4]连续pass [5]winner(-2=None)
+        [6]min_moves [7]max_moves
+        [8:10]当前局面 Zobrist 哈希 [10]历史局面条数
+        [11]/[12] 黑白子数 [13]/[14] 黑白累计提子
     """
     n = board.shape[0]
-    cur_h = ((np.uint64(st[13]) & _MASK32)
-             | ((np.uint64(st[14]) & _MASK32) << np.uint64(32)))
+    cur_h = _hash_from_slots(st)
     hist_n = _sync_history(st, hist, cur_h)
     if row == -1 and col == -1:                   # Pass
         st[1] = -1
         st[2] = -1
-        st[3] = -2                                # 停一手会解除劫禁
-        st[4] = -2
-        if st[0] == 1:
-            st[7] += 1
-        else:
-            st[8] += 1
-        st[6] += 1
-        st[5] += 1
+        st[4] += 1
+        st[3] += 1
         st[0] = -st[0]
-        _set_hash_slots(st, cur_h, cur_h)
-        if st[6] >= 2 or st[5] >= st[11]:
+        _set_hash_slots(st, cur_h)
+        if st[4] >= 2 or st[3] >= st[7]:
             go[0] = True
         return True
     h = cur_h
@@ -288,36 +310,90 @@ def _make_move(board, st, go, fp, row, col, cap, hist):
                 board[idx // n, idx % n] = -st[0]
             board[row, col] = 0
             return False
-        if captured == 1:                         # 简单劫点标记（仅供旧接口/GUI 展示）
-            ko_r = cap[0] // n
-            ko_c = cap[0] % n
-            board[ko_r, ko_c] = -st[0]
-            c2 = _capture_opponent(board, ko_r, ko_c, -st[0], n, cap)
-            board[ko_r, ko_c] = 0
-            if c2 == 1 and cap[0] == row * n + col:
-                st[3] = ko_r
-                st[4] = ko_c
-            else:
-                st[3] = -2
-                st[4] = -2
-        else:
-            st[3] = -2
-            st[4] = -2
-    else:
-        st[3] = -2
-        st[4] = -2
     st[1] = row
     st[2] = col
-    st[6] = 0
-    st[5] += 1
-    _set_hash_slots(st, h, cur_h)
+    st[4] = 0
+    st[3] += 1
+    # 增量维护的棋子/提子计数（放在超级劫回滚之后，回滚路径不用撤销）
+    st[11 + ci] += 1
+    if captured > 0:
+        st[11 + (1 - ci)] -= captured
+        st[13 + ci] += captured
+    _set_hash_slots(st, h)
     if hist_n < hist.shape[0]:                     # 记录本手后的局面
         hist[hist_n] = h
-        st[17] = hist_n + 1
+        st[10] = hist_n + 1
     st[0] = -st[0]          # 终局后 current_player = 下一手方，终局价值口径与双 Pass 一致
-    if st[5] >= st[11]:
+    if st[3] >= st[7]:
         go[0] = True
     return True
+
+@njit(cache=True)
+def _make_move_no_capture(board, st, go, fp, row, col, cap, hist, win_len):
+    """无提子/无气/无劫的落子（五子棋这类「占位 + 连子判胜」的规则用）。
+
+    win_len <= 0 表示不计胜负（纯占位）；>=2 时「同色连成 win_len 或更长」即胜。
+    其余约定与 _make_move 一致：落子后换手、st[3] 计手、终局置 go[0]。
+    """
+    if row < 0 or col < 0:
+        return False
+    n = board.shape[0]
+    if board[row, col] != 0:
+        return False
+    player = st[0]
+    board[row, col] = player
+    st[1] = row
+    st[2] = col
+    st[3] += 1
+    if win_len >= 2:
+        won = False
+        for k in range(4):
+            if k == 0:
+                dr, dc = 0, 1
+            elif k == 1:
+                dr, dc = 1, 0
+            elif k == 2:
+                dr, dc = 1, 1
+            else:
+                dr, dc = 1, -1
+            cnt = 1
+            rr, cc = row + dr, col + dc
+            while 0 <= rr < n and 0 <= cc < n and board[rr, cc] == player:
+                cnt += 1
+                rr += dr
+                cc += dc
+            rr, cc = row - dr, col - dc
+            while 0 <= rr < n and 0 <= cc < n and board[rr, cc] == player:
+                cnt += 1
+                rr -= dr
+                cc -= dc
+            if cnt >= win_len:
+                won = True
+                break
+        if won:
+            go[0] = True
+            st[5] = player
+    if not go[0] and st[3] >= n * n:
+        go[0] = True
+        st[5] = 0
+    st[0] = -player
+    return True
+
+
+@njit(cache=True)
+def _make_move_dispatch(board, st, go, fp, cap, hist, row, col, kind, win_len):
+    """MCTS 用的落子入口：kind=0 围棋（提子/劫/超级劫），kind=1 无提子连子规则。
+
+    为什么不用「把函数当参数传进来」：Numba 的磁盘缓存会把函数类型写进索引再
+    pickle，Dispatcher 不可序列化，cache=True 时保存索引直接抛
+    ReferenceError（GUI 里表现为搜索线程静默停掉），只能靠关缓存绕开，
+    代价是每个进程首次搜索要重编译 10 秒以上。改成按 kind 分支后，
+    所有 numba 函数都能正常缓存。
+    """
+    if kind == 0:
+        return _make_move(board, st, go, fp, row, col, cap, hist)
+    return _make_move_no_capture(board, st, go, fp, row, col, cap, hist, win_len)
+
 
 @njit(cache=True)
 def _move_captures(board, r, c, player, n, seen, stack, stamp):
@@ -384,20 +460,15 @@ def _move_captures(board, r, c, player, n, seen, stack, stamp):
 
 @njit(cache=True)
 def _legal_moves_and_mask(board, st, n, moves, mask, hist):
-    """合法着法；moves: int32缓冲(n*n+1)，mask: float32(n*n+1)"""
+    """合法着法；moves: int32缓冲(n*n+1)，mask: float32(n*n+1)
+
+    超级劫是唯一的重复局面判据（已覆盖普通劫）。提子点自己有气也可能提子，
+    所以不能只走「有气」快速路径，必须用 _move_captures 判定是否真的提子。
+    """
     total = n * n
     mask[:] = 0.0
     count = 0
-    if st[0] == 1:
-        forced = st[8] >= st[12]
-    else:
-        forced = st[7] >= st[12]
-    if forced:                                    # 强制 pass
-        moves[count] = total
-        count += 1
-        mask[total] = 1.0
-        return count
-    cur_h, prev_h = _hash_from_slots(st)
+    cur_h = _hash_from_slots(st)
     hist_n = _sync_history(st, hist, cur_h)
     seen = np.zeros(total, dtype=np.int32)
     stack = np.zeros(total, dtype=np.int32)
@@ -417,8 +488,7 @@ def _legal_moves_and_mask(board, st, n, moves, mask, hist):
                 has_air = True
             # 有相邻空点也可能提子（还取决于敌块是否另有气），
             # 提子就可能重现历史局面，必须走完整判定。
-            is_ko = st[3] != -2 and r == st[3] and c == st[4]
-            if has_air and not is_ko:
+            if has_air:
                 opp = -st[0]
                 adj_opp = False
                 if r > 0 and board[r - 1, c] == opp:
@@ -436,154 +506,294 @@ def _legal_moves_and_mask(board, st, n, moves, mask, hist):
                     count += 1
                     mask[i] = 1.0
                     continue
-            if _is_legal_impl(board, r, c, st[0], st[3], st[4],
-                              cur_h, prev_h, True, n, hist, hist_n):
+            if _is_legal_impl(board, r, c, st[0], cur_h, n, hist, hist_n):
                 moves[count] = i
                 count += 1
                 mask[i] = 1.0
-    if st[5] >= st[10]:
+    if st[3] >= st[6]:
         moves[count] = total
         count += 1
         mask[total] = 1.0
     return count
 
 
-@njit(cache=True)
-def _legal_mask_for(board, player, ko_r, ko_c, n, mask):
-    """只算棋盘合法点（不含 pass），用于黑白互换增强重算 legal 通道。
+@njit(cache=False)
+def _ladder_chain(board, n, r, c, pr, pc, lr, lc):
+    color = board[r, c]
+    if color != 1 and color != -1:
+        return 0, 0
+    seen = np.zeros((n, n), dtype=np.uint8)
+    stack = np.zeros(n * n, dtype=np.int32)
+    stack[0] = r * n + c
+    top = 1
+    seen[r, c] = 1
+    np_ = 0
+    nl = 0
+    while top > 0:
+        top -= 1
+        cur = stack[top]
+        cr = cur // n
+        cc = cur % n
+        pr[np_] = cr
+        pc[np_] = cc
+        np_ += 1
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr = cr + dr
+            nc = cc + dc
+            if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                continue
+            v = board[nr, nc]
+            if v == 0:
+                dup = False
+                for k in range(nl):
+                    if lr[k] == nr and lc[k] == nc:
+                        dup = True
+                        break
+                if not dup:
+                    lr[nl] = nr
+                    lc[nl] = nc
+                    nl += 1
+            elif v == color and seen[nr, nc] == 0:
+                seen[nr, nc] = 1
+                stack[top] = nr * n + nc
+                top += 1
+    return np_, nl
 
-    board 用绝对/当前玩家相对符号均可，只要与 player 一致；ko_r/ko_c=-2 表示无劫。
-    这里没有历史局面，超级劫退化为旧的 ko 点判据。
+
+@njit(cache=False)
+def _ladder_play(board, n, r, c, color, opr, opc, olr, olc):
+    b = board.copy()
+    b[r, c] = color
+    captured = 0
+    seen = np.zeros((n, n), dtype=np.uint8)
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr = r + dr
+        nc = c + dc
+        if nr < 0 or nr >= n or nc < 0 or nc >= n:
+            continue
+        if b[nr, nc] != -color or seen[nr, nc] != 0:
+            continue
+        np2, nl2 = _ladder_chain(b, n, nr, nc, opr, opc, olr, olc)
+        for k in range(np2):
+            seen[opr[k], opc[k]] = 1
+        if nl2 == 0:
+            for k in range(np2):
+                b[opr[k], opc[k]] = 0
+            captured += np2
+    np3, nl3 = _ladder_chain(b, n, r, c, opr, opc, olr, olc)
+    if nl3 == 0:
+        return b, captured, False
+    return b, captured, True
+
+
+@njit(cache=False)
+def _ladder_dfs(board, n, dr0, dc0, ar0, ac0, color, turn, depth, max_depth,
+                pr, pc, lr, lc, qr, qc, opr, opc, olr, olc):
+    if depth > max_depth:
+        return 0
+    np_, nl_ = _ladder_chain(board, n, dr0, dc0, pr, pc, lr, lc)
+    if np_ == 0 or nl_ == 0:
+        return -1
+    if nl_ >= 3:
+        return 1
+
+    # 递归会复用 pr/pc/lr/lc；先把自己的气拷出来，否则下一轮读到的是子节点的数据。
+    mr = np.zeros(n * n, dtype=np.int32)
+    mc = np.zeros(n * n, dtype=np.int32)
+    for i in range(nl_):
+        mr[i] = lr[i]
+        mc[i] = lc[i]
+
+    if turn == color:
+        if nl_ != 1:
+            return 0
+        cand_r = np.zeros(n * n, dtype=np.int32)
+        cand_c = np.zeros(n * n, dtype=np.int32)
+        cand_r[0] = mr[0]
+        cand_c[0] = mc[0]
+        ncand = 1
+        seen_att = np.zeros((n, n), dtype=np.uint8)
+        for k in range(np_):
+            sr = pr[k]
+            sc = pc[k]
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr = sr + dr
+                nc = sc + dc
+                if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                    continue
+                if board[nr, nc] != -color or seen_att[nr, nc] != 0:
+                    continue
+                anp, anl = _ladder_chain(board, n, nr, nc, opr, opc, olr, olc)
+                for t in range(anp):
+                    seen_att[opr[t], opc[t]] = 1
+                if anl == 1:
+                    ar = olr[0]
+                    ac = olc[0]
+                    dup = False
+                    for t in range(ncand):
+                        if cand_r[t] == ar and cand_c[t] == ac:
+                            dup = True
+                            break
+                    if not dup:
+                        cand_r[ncand] = ar
+                        cand_c[ncand] = ac
+                        ncand += 1
+        unknown = False
+        for t in range(ncand):
+            b2, cap, legal = _ladder_play(board, n, cand_r[t], cand_c[t], color,
+                                          opr, opc, olr, olc)
+            if not legal:
+                continue
+            np2, nl2 = _ladder_chain(b2, n, dr0, dc0, pr, pc, lr, lc)
+            if np2 == 0:
+                continue
+            if nl2 >= 3:
+                return 1
+            r2 = _ladder_dfs(b2, n, dr0, dc0, ar0, ac0, color, -turn,
+                             depth + 1, max_depth, pr, pc, lr, lc,
+                             qr, qc, opr, opc, olr, olc)
+            if r2 == 1:
+                return 1
+            if r2 == 0:
+                unknown = True
+        return 0 if unknown else -1
+
+    if nl_ > 2:
+        return 0
+    unknown = False
+    for k in range(nl_):
+        b2, cap, legal = _ladder_play(board, n, mr[k], mc[k], turn,
+                                      opr, opc, olr, olc)
+        if not legal:
+            continue
+        np2, nl2 = _ladder_chain(b2, n, dr0, dc0, pr, pc, lr, lc)
+        if np2 == 0:
+            return -1
+        if cap > 0:
+            unknown = True
+            continue
+        if nl2 != 1:
+            continue
+        # 攻方自己只剩 1 气：这是自打吃，不是征子应手，整条分支直接剪掉，
+        # 不递归、也不记为 UNKNOWN。
+        anp, anl = _ladder_chain(b2, n, mr[k], mc[k], opr, opc, olr, olc)
+        if anl <= 1:
+            continue
+        r2 = _ladder_dfs(b2, n, dr0, dc0, mr[k], mc[k], color, color,
+                         depth + 1, max_depth, pr, pc, lr, lc,
+                         qr, qc, opr, opc, olr, olc)
+        if r2 == -1:
+            return -1
+        if r2 == 0:
+            unknown = True
+    return 0 if unknown else 1
+
+
+@njit(cache=False)
+def _ladder_status(board, n, dr0, dc0, turn, max_depth):
+    cap = n * n
+    pr = np.zeros(cap, dtype=np.int32)
+    pc = np.zeros(cap, dtype=np.int32)
+    lr = np.zeros(cap, dtype=np.int32)
+    lc = np.zeros(cap, dtype=np.int32)
+    qr = np.zeros(cap, dtype=np.int32)
+    qc = np.zeros(cap, dtype=np.int32)
+    opr = np.zeros(cap, dtype=np.int32)
+    opc = np.zeros(cap, dtype=np.int32)
+    olr = np.zeros(cap, dtype=np.int32)
+    olc = np.zeros(cap, dtype=np.int32)
+    np_, nl_ = _ladder_chain(board, n, dr0, dc0, pr, pc, lr, lc)
+    if np_ == 0 or nl_ != 1:
+        return 0
+    color = board[dr0, dc0]
+    if turn != color:
+        return -1
+    return _ladder_dfs(board, n, dr0, dc0, dr0, dc0, color, turn, 0,
+                       max_depth, pr, pc, lr, lc, qr, qc,
+                       opr, opc, olr, olc)
+
+
+@njit(cache=False)
+def _ladder_channels(board, n, player, own_ladder, opp_ladder):
+    """给所有「只剩 1 气」的棋块写征子状态。
+
+    每个块都按「该块自己先走」求值：己方通道假设当前方先走，对方通道假设对方先走。
+    这样对方通道也会出现 +1（假设对方先走能逃），而不是一律 -1。
     """
-    mask[:] = 0.0
-    dummy_hist = np.zeros(1, dtype=np.uint64)
+    own_ladder[:, :] = 0.0
+    opp_ladder[:, :] = 0.0
+    labels = np.zeros((n, n), dtype=np.int32)
+    lib = np.zeros(n * n + 1, dtype=np.int32)
+    rep_r = np.zeros(n * n + 1, dtype=np.int32)
+    rep_c = np.zeros(n * n + 1, dtype=np.int32)
+    gcol = np.zeros(n * n + 1, dtype=np.int8)
+    lib_seen = np.zeros(n * n, dtype=np.int32)
+    stack = np.zeros(n * n, dtype=np.int32)
+    status = np.zeros(n * n + 1, dtype=np.int8)
+    nblk = 0
     for r in range(n):
         for c in range(n):
-            if board[r, c] != 0:
+            color = board[r, c]
+            if color != 1 and color != -1:
                 continue
-            i = r * n + c
-            has_air = False
-            if r > 0 and board[r - 1, c] == 0:
-                has_air = True
-            elif r < n - 1 and board[r + 1, c] == 0:
-                has_air = True
-            elif c > 0 and board[r, c - 1] == 0:
-                has_air = True
-            elif c < n - 1 and board[r, c + 1] == 0:
-                has_air = True
-            is_ko = ko_r != -2 and r == ko_r and c == ko_c
-            if (has_air and not is_ko) or _is_legal_impl(
-                    board, r, c, player, ko_r, ko_c,
-                    np.uint64(0), np.uint64(0), False, n, dummy_hist, 0):
-                mask[i] = 1.0
+            if labels[r, c] != 0:
+                continue
+            nblk += 1
+            gid = nblk
+            gcol[gid] = color
+            rep_r[gid] = r
+            rep_c[gid] = c
+            stack[0] = r * n + c
+            top = 1
+            labels[r, c] = gid
+            while top > 0:
+                top -= 1
+                cur = stack[top]
+                cr = cur // n
+                cc = cur % n
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr = cr + dr
+                    nc = cc + dc
+                    if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                        continue
+                    v = board[nr, nc]
+                    if v == 0:
+                        pos = nr * n + nc
+                        if lib_seen[pos] != gid:
+                            lib_seen[pos] = gid
+                            lib[gid] += 1
+                    elif v == color and labels[nr, nc] == 0:
+                        labels[nr, nc] = gid
+                        stack[top] = nr * n + nc
+                        top += 1
+
+    for gid in range(1, nblk + 1):
+        if lib[gid] != 1:
+            continue
+        # 两个通道都按「该棋块自己先走」求值：己方通道=当前方先走，
+        # 对方通道=假设对方先走、他能不能逃。不要按当前行棋方直接判 -1。
+        status[gid] = _ladder_status(board, n, rep_r[gid], rep_c[gid],
+                                     gcol[gid], 4 * n)
+
+    for r in range(n):
+        for c in range(n):
+            gid = labels[r, c]
+            if gid == 0 or status[gid] == 0:
+                continue
+            if gcol[gid] == player:
+                own_ladder[r, c] = status[gid]
+            else:
+                opp_ladder[r, c] = status[gid]
 
 
 @njit(cache=True)
-def _eye_color(board, n, r, c):
-    """点 (r,c) 是不是「单点真眼」；是则返回眼的归属色（+1/-1），不是返回 0。
+def _urgency_channels(board, n, player, own_urg, opp_urg):
+    """按棋块（同色 4-连通）算危急度，写进两个平面（下标见 hyperparams 的 CH_*）：
 
-    判据（贴边/角/镂空边时方向数自动变少，无需特判）：
-      ① 上下左右（盘内且不是洞）必须全是同一种颜色的子；
-      ② 对角：**中心**（4 个对角在盘内）至多 1 个敌方子；**边/角/洞边**
-         （2/1 个有效对角）必须全为己方。
-    洞与棋盘外同义：既不是气，也不是敌方子，不参与对角计数。
-    """
-    col = 0
-    # ① 四个正邻：同色且非空；洞视作盘外，跳过。
-    if r > 0:
-        v = board[r - 1, c]
-        if v != HOLE:
-            if v == 0:
-                return 0
-            col = v
-    if r < n - 1:
-        v = board[r + 1, c]
-        if v != HOLE:
-            if v == 0 or (col != 0 and v != col):
-                return 0
-            if col == 0:
-                col = v
-    if c > 0:
-        v = board[r, c - 1]
-        if v != HOLE:
-            if v == 0 or (col != 0 and v != col):
-                return 0
-            if col == 0:
-                col = v
-    if c < n - 1:
-        v = board[r, c + 1]
-        if v != HOLE:
-            if v == 0 or (col != 0 and v != col):
-                return 0
-            if col == 0:
-                col = v
-    if col == 0:
-        return 0
-    # ② 对角：nd = 有效对角数（4=中心、2=边、1=角/洞边），enemy=敌方数，nonown=非己方数（含空）
-    nd = 0
-    enemy = 0
-    nonown = 0
-    if r > 0 and c > 0:
-        v = board[r - 1, c - 1]
-        if v != HOLE:
-            nd += 1
-            if v == -col:
-                enemy += 1
-                nonown += 1
-            elif v == 0:
-                nonown += 1
-    if r > 0 and c < n - 1:
-        v = board[r - 1, c + 1]
-        if v != HOLE:
-            nd += 1
-            if v == -col:
-                enemy += 1
-                nonown += 1
-            elif v == 0:
-                nonown += 1
-    if r < n - 1 and c > 0:
-        v = board[r + 1, c - 1]
-        if v != HOLE:
-            nd += 1
-            if v == -col:
-                enemy += 1
-                nonown += 1
-            elif v == 0:
-                nonown += 1
-    if r < n - 1 and c < n - 1:
-        v = board[r + 1, c + 1]
-        if v != HOLE:
-            nd += 1
-            if v == -col:
-                enemy += 1
-                nonown += 1
-            elif v == 0:
-                nonown += 1
-    if nd == 4:
-        return col if enemy <= 1 else 0
-    return col if nonown == 0 else 0
+    1 气 = 1.0 最危急，>=4 气 = 0 安全；空点与非本颜色为 0。
 
-
-@njit(cache=True)
-def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
-    """按棋块（同色连通）算三类特征，写进四个平面（下标见 hyperparams 的 CH_*）：
-
-    危急度（own_urg/opp_urg）：1 气 = 1.0 最危急，>=4 气 = 0 安全；空点与非本颜色为 0。
-    眼（own_eye/opp_eye）：0 眼 = 0、1 眼 = 0.5、>=2 眼 = 1，**整个广义块共享同一个值**。
-
-    眼不再数「单点真眼」，而是折算**眼区**（Benson 的 region）：一个极大的 4-邻接空点连通块，
-    其全部盘内 4-邻点都是同一种颜色的棋子（可来自多块棋；对角不参与连通、也不参与包围判定）。
-    折算规则：
-      面积 1    → 仍要求过 `_eye_color`（含对角条件）才算 1 只 —— 它是「现成的眼」，必须是真眼；
-      面积 2~5  → 1 只；面积 >=6 → 2 只。这一档是「眼形空间」（能做出眼），不是「已经是眼」：
-                  直二做不出两只眼、三目要抢先手 ⇒ 都值 1 只；直四及以上无条件活 ⇒ 值 2 只。
-    为什么换掉旧判据：只看单点真眼时，任何大眼空间（直二 / 方四 / 刀把五…）里每个点都有空的正邻、
-    过不了判据，**整片记 0 眼** —— 实测 86% 的块恒为 0，通道几乎不携带信息（改前实测见
-    `tools/srv/probe_eye_space.py`）。
-
-    广义连接：**共享 >=2 个空点**的同色棋块并成一组（对手一手切不断，斜对角、双叫吃那类
-    「没连成一块但本质上是一大块」的形状）；组内眼区**去重**后求和（两块共享的同一只眼只算一次，
-    否则共活形状会被数成两只）。危急度仍按**原始块**算 —— 合并后的气数会重复计、反而失真。
+    眼通道已删除：原来那套「眼区折算」在复杂死活里错误率很高，模型照着学等于把
+    启发式的错误固化成输入（消融：去掉只掉 2~4% 损失，目差 MAE +1.5 目）。
     """
     nn = n * n
     labels = np.zeros((n, n), dtype=np.int32)      # 0=未访问/空，>0=块号
@@ -656,253 +866,292 @@ def _group_channels(board, n, player, own_urg, opp_urg, own_eye, opp_eye):
                         stack[top] = cr * n + (cc + 1)
                         top += 1
 
-    # ---- 空区域（眼区候选）：区域号 + 点列表，一次 BFS 拿全 ----
-    # 存点列表是为了按区域枚举它的点；否则每判一个区域都要重扫全盘。
-    reg_lab = np.full((n, n), -1, dtype=np.int32)
-    reg_pts = np.zeros(nn, dtype=np.int32)
-    reg_start = np.zeros(nn + 1, dtype=np.int32)
-    reg_size = np.zeros(nn + 1, dtype=np.int32)
-    nreg = 0
-    npos = 0
-    for r in range(n):
-        for c in range(n):
-            if board[r, c] != 0 or reg_lab[r, c] >= 0:
-                continue
-            nreg += 1
-            rid = nreg
-            reg_start[rid] = npos
-            top = 0
-            stack[top] = r * n + c
-            top += 1
-            reg_lab[r, c] = rid
-            cnt = 0
-            while top > 0:
-                top -= 1
-                cur = stack[top]
-                reg_pts[npos] = cur
-                npos += 1
-                cnt += 1
-                cr = cur // n
-                cc = cur % n
-                if cr > 0 and board[cr - 1, cc] == 0 and reg_lab[cr - 1, cc] < 0:
-                    reg_lab[cr - 1, cc] = rid
-                    stack[top] = (cr - 1) * n + cc
-                    top += 1
-                if cr < n - 1 and board[cr + 1, cc] == 0 and reg_lab[cr + 1, cc] < 0:
-                    reg_lab[cr + 1, cc] = rid
-                    stack[top] = (cr + 1) * n + cc
-                    top += 1
-                if cc > 0 and board[cr, cc - 1] == 0 and reg_lab[cr, cc - 1] < 0:
-                    reg_lab[cr, cc - 1] = rid
-                    stack[top] = cr * n + (cc - 1)
-                    top += 1
-                if cc < n - 1 and board[cr, cc + 1] == 0 and reg_lab[cr, cc + 1] < 0:
-                    reg_lab[cr, cc + 1] = rid
-                    stack[top] = cr * n + (cc + 1)
-                    top += 1
-            reg_size[rid] = cnt
-
-    # ---- 广义连接：并查集 + 「同色块对 → 共享空点数」的哈希计数表 ----
-    parent = np.arange(nblk + 1, dtype=np.int32)
-    # njit 里没有 dict，用开放寻址哈希。只有被两块以上同色棋夹住的空点才会插入；
-    # 19 路极端局面可能超过 512 个块对，给到 4096 避免静默漏合并（溢出只会漏特征，不会崩）。
-    HS = 4096
-    hkey = np.full(HS, -1, dtype=np.int32)
-    hcnt = np.zeros(HS, dtype=np.int32)
-    blk_l = np.empty(4, dtype=np.int32)
-    blk_c = np.empty(4, dtype=np.int8)
-    nbb = nblk + 1
-    for r in range(n):
-        for c in range(n):
-            if board[r, c] != 0:
-                continue
-            k = 0
-            if r > 0 and board[r - 1, c] != 0 and board[r - 1, c] != HOLE:
-                blk_l[k] = labels[r - 1, c]
-                blk_c[k] = board[r - 1, c]
-                k += 1
-            if r < n - 1 and board[r + 1, c] != 0 and board[r + 1, c] != HOLE:
-                blk_l[k] = labels[r + 1, c]
-                blk_c[k] = board[r + 1, c]
-                k += 1
-            if c > 0 and board[r, c - 1] != 0 and board[r, c - 1] != HOLE:
-                blk_l[k] = labels[r, c - 1]
-                blk_c[k] = board[r, c - 1]
-                k += 1
-            if c < n - 1 and board[r, c + 1] != 0 and board[r, c + 1] != HOLE:
-                blk_l[k] = labels[r, c + 1]
-                blk_c[k] = board[r, c + 1]
-                k += 1
-            # 同一个邻块可能从两个方向贴住这个空点（L 形包围）⇒ 块对会被重复枚举，把「共享空点数」
-            # 虚高（实测把只共享 1 个空点的对算成 2，越过下面的 >=2 阈值）⇒ 先按 (色, 块号) 去重。
-            kk = 0
-            for i in range(k):
-                dup = False
-                for j in range(i):
-                    if blk_c[j] == blk_c[i] and blk_l[j] == blk_l[i]:
-                        dup = True
-                        break
-                if not dup:
-                    blk_l[kk] = blk_l[i]
-                    blk_c[kk] = blk_c[i]
-                    kk += 1
-            k = kk
-            for i in range(k):
-                for j in range(i + 1, k):
-                    if blk_c[i] != blk_c[j]:       # 只并同色块：中间夹着对方子说明这两块并没连上
-                        continue
-                    a = blk_l[i]
-                    b = blk_l[j]
-                    if a == b:
-                        continue
-                    key = a * nbb + b if a < b else b * nbb + a
-                    h = key % HS
-                    step = 0
-                    while step < HS:
-                        if hkey[h] == -1:
-                            hkey[h] = key
-                            hcnt[h] = 1
-                            break
-                        if hkey[h] == key:
-                            hcnt[h] += 1
-                            break
-                        h += 1
-                        if h >= HS:
-                            h = 0
-                        step += 1
-    for h in range(HS):
-        if hkey[h] >= 0 and hcnt[h] >= 2:
-            a = hkey[h] // nbb
-            b = hkey[h] % nbb
-            while parent[a] != a:
-                a = parent[a]
-            while parent[b] != b:
-                b = parent[b]
-            if a != b:
-                parent[a] = b
-
-    # ---- 眼区判定与折算，把等效眼数记到「组」上（组内按区域去重）----
-    grp_eye = np.zeros(nblk + 1, dtype=np.int32)
-    mark = np.zeros(nblk + 1, dtype=np.int32)      # 本区域已给哪些组加过眼（用戳号免清零）
-    stamp = 0
-    for rid in range(1, nreg + 1):
-        s0 = reg_start[rid]
-        e0 = s0 + reg_size[rid]
-        # 归属色：区域的全部盘内邻点必须同色。出现第二种色 ⇒ 公共气；一个邻点都没有 ⇒ 整盘空。
-        col = 0
-        bad = False
-        for i in range(s0, e0):
-            cur = reg_pts[i]
-            cr = cur // n
-            cc = cur % n
-            if cr > 0 and board[cr - 1, cc] != 0:
-                v = board[cr - 1, cc]
-                if v != HOLE:
-                    if col == 0:
-                        col = v
-                    elif v != col:
-                        bad = True
-                        break
-            if cr < n - 1 and board[cr + 1, cc] != 0:
-                v = board[cr + 1, cc]
-                if v != HOLE:
-                    if col == 0:
-                        col = v
-                    elif v != col:
-                        bad = True
-                        break
-            if cc > 0 and board[cr, cc - 1] != 0:
-                v = board[cr, cc - 1]
-                if v != HOLE:
-                    if col == 0:
-                        col = v
-                    elif v != col:
-                        bad = True
-                        break
-            if cc < n - 1 and board[cr, cc + 1] != 0:
-                v = board[cr, cc + 1]
-                if v != HOLE:
-                    if col == 0:
-                        col = v
-                    elif v != col:
-                        bad = True
-                        break
-        if bad or col == 0:
-            continue
-        if reg_size[rid] == 1:
-            cur = reg_pts[s0]
-            if _eye_color(board, n, cur // n, cur % n) == 0:
-                continue                           # 假眼（对角条件不满足）⇒ 不计
-            e = 1
-        elif reg_size[rid] <= 5:
-            e = 1
-        else:
-            e = 2
-        stamp += 1
-        for i in range(s0, e0):
-            cur = reg_pts[i]
-            cr = cur // n
-            cc = cur % n
-            if cr > 0 and board[cr - 1, cc] == col:
-                g = labels[cr - 1, cc]
-                while parent[g] != g:
-                    g = parent[g]
-                if mark[g] != stamp:
-                    mark[g] = stamp
-                    grp_eye[g] += e
-            if cr < n - 1 and board[cr + 1, cc] == col:
-                g = labels[cr + 1, cc]
-                while parent[g] != g:
-                    g = parent[g]
-                if mark[g] != stamp:
-                    mark[g] = stamp
-                    grp_eye[g] += e
-            if cc > 0 and board[cr, cc - 1] == col:
-                g = labels[cr, cc - 1]
-                while parent[g] != g:
-                    g = parent[g]
-                if mark[g] != stamp:
-                    mark[g] = stamp
-                    grp_eye[g] += e
-            if cc < n - 1 and board[cr, cc + 1] == col:
-                g = labels[cr, cc + 1]
-                while parent[g] != g:
-                    g = parent[g]
-                if mark[g] != stamp:
-                    mark[g] = stamp
-                    grp_eye[g] += e
-
     for r in range(n):
         for c in range(n):
             b = board[r, c]
             if b == 0 or b == HOLE:
                 continue
-            gid = labels[r, c]
-            g = gid
-            while parent[g] != g:
-                g = parent[g]
-            v = (4 - min(lib[gid], 4)) / 3.0       # 危急度仍按**原始块**的气数（合并后会重复计）
-            ee = grp_eye[g]
-            ev = 0.0 if ee == 0 else (0.5 if ee == 1 else 1.0)
+            v = (4 - min(lib[labels[r, c]], 4)) / 3.0
             if b == player:
                 own_urg[r, c] = v
-                own_eye[r, c] = ev
             else:
                 opp_urg[r, c] = v
-                opp_eye[r, c] = ev
 
 @njit(cache=True)
-def _canonical_state(board, st, n, komi, player, out, boundary):
-    """当前玩家视角规范输入（训练/自对弈/MCTS/GUI 全链路共用同一编码）。
+def _benson_color(board, n, color, out):
+    """把 color 方的 Benson「无条件活」（pass-alive）棋子写进 out（1.0 / 0.0）。
+
+    定义（Benson 1976，与「对手全 pass 也杀不掉」等价）：
+      黑棋包围区域 R = 不含 color 子、且边界邻点全是 color 子的区域
+                       （R 取「非 color、非洞」的连通分量，边界条件自动成立）。
+      R 是串 s 的关键区域 ⇔ ①R 是包围区域；②与 R 相邻的每个 color 串都在 S 里；
+                              ③R 内每个点要么是对方子，要么是 s 的气。
+      S 无条件活 ⇔ S 中每个串都至少有 2 个关键区域。
+    Benson 算法：从全部串开始，反复删掉「关键区域 < 2 个」的串，直到不动点；
+    剩下的就是最大无条件活集合。
+
+    实现要点：
+      - 条件③用「空点相邻串集合的交集」判定，每个空点最多 4 个相邻串，
+        区域只需做 ≤4 元小集合求交，避免 O(|R|×|S|)。
+      - 删串会杀死「与它相邻的所有区域」（条件②是区域级的），用队列级联传播，
+        每个串/区域最多处理一次，整体 O(N + 边数)。
+    本引擎禁止自杀 ⇒ 用标准（宽）关键区域。
+    """
+    N = n * n
+    out[:, :] = 0.0
+
+    # ---- 1. 串标记（所有棋子；同色 4-连通）----
+    label = np.full((n, n), -1, dtype=np.int32)
+    s_color = np.full(N, 2, dtype=np.int8)
+    stack = np.zeros(N, dtype=np.int32)
+    ns = 0
+    for r0 in range(n):
+        for c0 in range(n):
+            v = board[r0, c0]
+            if (v != 1 and v != -1) or label[r0, c0] != -1:
+                continue
+            label[r0, c0] = ns
+            s_color[ns] = v
+            top = 1
+            stack[0] = r0 * n + c0
+            while top > 0:
+                top -= 1
+                cur = stack[top]
+                cr = cur // n
+                cc = cur % n
+                if cr > 0 and board[cr - 1, cc] == v and label[cr - 1, cc] == -1:
+                    label[cr - 1, cc] = ns
+                    stack[top] = (cr - 1) * n + cc
+                    top += 1
+                if cr < n - 1 and board[cr + 1, cc] == v and label[cr + 1, cc] == -1:
+                    label[cr + 1, cc] = ns
+                    stack[top] = (cr + 1) * n + cc
+                    top += 1
+                if cc > 0 and board[cr, cc - 1] == v and label[cr, cc - 1] == -1:
+                    label[cr, cc - 1] = ns
+                    stack[top] = cr * n + (cc - 1)
+                    top += 1
+                if cc < n - 1 and board[cr, cc + 1] == v and label[cr, cc + 1] == -1:
+                    label[cr, cc + 1] = ns
+                    stack[top] = cr * n + (cc + 1)
+                    top += 1
+            ns += 1
+    if ns == 0:
+        return
+
+    # ---- 2. 区域：非 color、非洞的连通分量（边界条件自动成立）----
+    reg = np.full((n, n), -1, dtype=np.int32)
+    nr = 0
+    for r0 in range(n):
+        for c0 in range(n):
+            v = board[r0, c0]
+            if v == color or v == HOLE or reg[r0, c0] != -1:
+                continue
+            reg[r0, c0] = nr
+            top = 1
+            stack[0] = r0 * n + c0
+            while top > 0:
+                top -= 1
+                cur = stack[top]
+                cr = cur // n
+                cc = cur % n
+                if cr > 0 and board[cr - 1, cc] != color and board[cr - 1, cc] != HOLE \
+                        and reg[cr - 1, cc] == -1:
+                    reg[cr - 1, cc] = nr
+                    stack[top] = (cr - 1) * n + cc
+                    top += 1
+                if cr < n - 1 and board[cr + 1, cc] != color and board[cr + 1, cc] != HOLE \
+                        and reg[cr + 1, cc] == -1:
+                    reg[cr + 1, cc] = nr
+                    stack[top] = (cr + 1) * n + cc
+                    top += 1
+                if cc > 0 and board[cr, cc - 1] != color and board[cr, cc - 1] != HOLE \
+                        and reg[cr, cc - 1] == -1:
+                    reg[cr, cc - 1] = nr
+                    stack[top] = cr * n + (cc - 1)
+                    top += 1
+                if cc < n - 1 and board[cr, cc + 1] != color and board[cr, cc + 1] != HOLE \
+                        and reg[cr, cc + 1] == -1:
+                    reg[cr, cc + 1] = nr
+                    stack[top] = cr * n + (cc + 1)
+                    top += 1
+            nr += 1
+    if nr == 0:
+        return
+
+    # ---- 3. 每个区域：相邻串数 + 关键串交集（条件③）----
+    adj_cnt = np.zeros(nr, dtype=np.int32)
+    vit_buf = np.full((nr, 4), -1, dtype=np.int32)
+    vit_n = np.full(nr, -1, dtype=np.int32)     # -1 = 该区域还没有空点
+    seen = np.zeros(ns, dtype=np.int32)
+    tmp = np.zeros(4, dtype=np.int32)
+    for r in range(n):
+        for c in range(n):
+            rid = reg[r, c]
+            if rid < 0:
+                continue
+            ntmp = 0
+            for k in range(4):
+                if k == 0:
+                    rr, cc = r - 1, c
+                elif k == 1:
+                    rr, cc = r + 1, c
+                elif k == 2:
+                    rr, cc = r, c - 1
+                else:
+                    rr, cc = r, c + 1
+                if rr < 0 or rr >= n or cc < 0 or cc >= n:
+                    continue
+                if board[rr, cc] != color:
+                    continue
+                sid = label[rr, cc]
+                if seen[sid] != rid + 1:
+                    seen[sid] = rid + 1
+                    adj_cnt[rid] += 1
+                dup = False
+                for t in range(ntmp):
+                    if tmp[t] == sid:
+                        dup = True
+                        break
+                if not dup:
+                    tmp[ntmp] = sid
+                    ntmp += 1
+            if board[r, c] != 0:
+                continue
+            # 空点：与当前交集求交
+            if vit_n[rid] < 0:
+                vit_n[rid] = ntmp
+                for t in range(ntmp):
+                    vit_buf[rid, t] = tmp[t]
+            else:
+                keep = 0
+                for t in range(vit_n[rid]):
+                    s0 = vit_buf[rid, t]
+                    hit = False
+                    for m in range(ntmp):
+                        if tmp[m] == s0:
+                            hit = True
+                            break
+                    if hit:
+                        vit_buf[rid, keep] = s0
+                        keep += 1
+                vit_n[rid] = keep
+
+    # ---- 4. CSR：区域→相邻串、区域→关键串、串→相邻区域 ----
+    adj_off = np.zeros(nr + 1, dtype=np.int32)
+    vit_off = np.zeros(nr + 1, dtype=np.int32)
+    for rid in range(nr):
+        adj_off[rid + 1] = adj_off[rid] + adj_cnt[rid]
+        vn = vit_n[rid]
+        if vn < 0:
+            vn = 0
+        vit_off[rid + 1] = vit_off[rid] + vn
+    adj_idx = np.zeros(adj_off[nr], dtype=np.int32)
+    vit_idx = np.zeros(vit_off[nr], dtype=np.int32)
+    pos = np.zeros(nr, dtype=np.int32)
+    seen[:] = 0
+    for r in range(n):
+        for c in range(n):
+            rid = reg[r, c]
+            if rid < 0:
+                continue
+            for k in range(4):
+                if k == 0:
+                    rr, cc = r - 1, c
+                elif k == 1:
+                    rr, cc = r + 1, c
+                elif k == 2:
+                    rr, cc = r, c - 1
+                else:
+                    rr, cc = r, c + 1
+                if rr < 0 or rr >= n or cc < 0 or cc >= n:
+                    continue
+                if board[rr, cc] != color:
+                    continue
+                sid = label[rr, cc]
+                if seen[sid] != rid + 1:
+                    seen[sid] = rid + 1
+                    adj_idx[adj_off[rid] + pos[rid]] = sid
+                    pos[rid] += 1
+    for rid in range(nr):
+        vn = vit_n[rid]
+        if vn < 0:
+            continue
+        for t in range(vn):
+            vit_idx[vit_off[rid] + t] = vit_buf[rid, t]
+
+    r_cnt = np.zeros(ns, dtype=np.int32)
+    for e in range(adj_off[nr]):
+        r_cnt[adj_idx[e]] += 1
+    r_off = np.zeros(ns + 1, dtype=np.int32)
+    for s in range(ns):
+        r_off[s + 1] = r_off[s] + r_cnt[s]
+    r_idx = np.zeros(r_off[ns], dtype=np.int32)
+    fpos = np.zeros(ns, dtype=np.int32)
+    for rid in range(nr):
+        for e in range(adj_off[rid], adj_off[rid + 1]):
+            s = adj_idx[e]
+            r_idx[r_off[s] + fpos[s]] = rid
+            fpos[s] += 1
+
+    # ---- 5. 单调删除到不动点 ----
+    alive = np.zeros(ns, dtype=np.bool_)
+    cnt = np.zeros(ns, dtype=np.int32)
+    for e in range(vit_off[nr]):
+        cnt[vit_idx[e]] += 1
+    queue = np.zeros(ns, dtype=np.int32)
+    qt = 0
+    for s in range(ns):
+        if s_color[s] == color:
+            alive[s] = True
+            if cnt[s] < 2:
+                queue[qt] = s
+                qt += 1
+    reg_alive = np.ones(nr, dtype=np.bool_)
+    qh = 0
+    while qh < qt:
+        s = queue[qh]
+        qh += 1
+        if not alive[s]:
+            continue
+        alive[s] = False
+        for e in range(r_off[s], r_off[s + 1]):
+            rid = r_idx[e]
+            if not reg_alive[rid]:
+                continue
+            reg_alive[rid] = False
+            for e2 in range(vit_off[rid], vit_off[rid + 1]):
+                s2 = vit_idx[e2]
+                if alive[s2]:
+                    cnt[s2] -= 1
+                    if cnt[s2] < 2:
+                        queue[qt] = s2
+                        qt += 1
+
+    # ---- 6. 输出掩码 ----
+    for r in range(n):
+        for c in range(n):
+            if board[r, c] == color and alive[label[r, c]]:
+                out[r, c] = 1.0
+
+
+@njit(cache=True)
+def _benson_channels(board, n, player, own_out, opp_out):
+    """己方/对方两个 Benson 无条件活通道（0/1）。"""
+    _benson_color(board, n, player, own_out)
+    _benson_color(board, n, -player, opp_out)
+
+
+@njit(cache=True)
+def _canonical_state(board, st, n, player, out, boundary):
+    """当前玩家视角的**空间**输入（训练/自对弈/MCTS/GUI 全链路共用同一编码）。
+
     各通道下标见 hyperparams 的 CH_* 常量 —— 布局只在那边定义一处，这里只负责填值。
-    通道2=上一手位置；通道3=贴目标量 kch = player*komi/14（player=当前玩家色，黑+1/白-1；
-        符号按俗称“黑贴X目”的贴目方向约定：黑行棋=+komi（黑欠白komi，黑须净胜过贴目），
-        白行棋=-komi（反向，即“白倒贴”视角，白含komi优势）；网络学到的语义
-        =当前玩家需克服的贴目，编码全链路自洽。若按“受益方”约定取反（白+黑-）亦可，
-        但改符号必须重训，勿单独改动！）
+    通道2=上一手位置；贴目不再占用空间通道，改由 GoGame.get_global_features()
+    生成独立的全局向量（当前 1 维，后续可扩成向量）。
+
     合法点掩码不在本函数内填 —— 它的来源（_legal_moves_and_mask）在热路径上
     每个节点本来就要算一次，由调用方复用、见 get_canonical_state。"""
-    kch = np.float32(player * komi / 14.0)
     last_valid = st[1] >= 0
     # 边界通道由 GoGame 每局预生成：洞 -1、内外边界 +1、其余可落子点 0。
     out[CH_BOUNDARY] = boundary
@@ -911,95 +1160,168 @@ def _canonical_state(board, st, n, komi, player, out, boundary):
             out[CH_OWN_STONES, r, c] = 1.0 if board[r, c] == player else 0.0
             out[CH_OPP_STONES, r, c] = 1.0 if board[r, c] == -player else 0.0
             out[CH_LAST_MOVE, r, c] = 1.0 if (last_valid and st[1] == r and st[2] == c) else 0.0
-            out[CH_KOMI, r, c] = kch
-    # 危急度与眼都由棋块（同色连通）决定，一次遍历里一起算完
-    _group_channels(board, n, player,
-                    out[CH_OWN_URGENCY], out[CH_OPP_URGENCY],
-                    out[CH_OWN_EYES], out[CH_OPP_EYES])
+    # 危急度按棋块（同色连通）决定；征子通道单独算，避免把递归求解器塞进带缓存的函数。
+    _urgency_channels(board, n, player,
+                      out[CH_OWN_URGENCY], out[CH_OPP_URGENCY])
+    # Benson 无条件活：两个 0/1 平面（形式化判定，不是启发式眼位）。
+    _benson_channels(board, n, player, out[CH_OWN_ALIVE], out[CH_OPP_ALIVE])
 
 
 @njit(cache=True)
 def _dead_lump_mask(board, n, out):
-    """终局清理：标出「子数 <= 2」或「独立气数 == 1」的棋块（out 为 True 的格子要移除）。
+    """终局清理：标出要移除的死子（out 为 True 的格子）。
 
-    为什么只清这两类：终局盘上的死子/残子绝大多数就是孤立一两颗、或者已经被打吃只剩一气，
-    而这两条判据够硬，不会伤到活棋。再往上做攻杀就得假设「防守方全程不落子」，
-    那等价于「活得下来 ≈ 有两只真眼」，会大面积过度判死。
-    只做一遍即可：移除小块只会让邻块的气变多，不会制造出新的待清块。
+    规则（迭代到不动点）：
+      0. **只剩一口气**：直接清除，优先级高于下面所有规则。
+      1. **孤子**：同色连通块 <= 5 子，且块内任何一颗子斜对角都没有同色棋。
+         - 1-2 子：直接判死清除。
+         - 3-5 子：紧邻敌方棋块里只要有气数 >= 3 的，判死清除；全 < 3 则保留（双活）。
+      2. 其余一律保留。
+
+    为什么第 1 条要迭代：一个子本身不孤立，是因为它斜对角还有同色接应；但那颗
+    接应子可能只剩一口气、会被第 2 条清掉。清掉之后它就变成了孤子，必须重新判定。
+    每一轮先按当前盘面把所有待清块**同时**标出（不是边标边改），再统一移除，
+    最多 n*n 轮（每轮至少少一颗子）。
+
+    ⚠️ 「小块」不等于「孤子」：尖、飞这类形状在斜线上还有接应，不能按孤子清。
+    ⚠️ 孤子的死活只由「紧邻敌方棋块的气」决定，不再看自己的气：双活里两块各自
+       只剩一两口气是常态，用「自己气少」判定会把双活整个清掉。
     """
+    out[:, :] = False
+    work = np.copy(board)
     labels = np.zeros((n, n), dtype=np.int32)     # 0=未访问/空，>0=组号
     lib_seen = np.zeros(n * n, dtype=np.int32)    # 印记法去重（存组号）
     lib = np.zeros(n * n + 1, dtype=np.int32)
     gsize = np.zeros(n * n + 1, dtype=np.int32)
+    gdiag = np.zeros(n * n + 1, dtype=np.bool_)   # 组内是否有棋子在斜对角挨着同色
+    elib = np.zeros(n * n + 1, dtype=np.int32)    # 紧邻敌块的最大气数
+    eseen = np.zeros(n * n + 1, dtype=np.int32)   # 敌块去重（印记=当前组号）
+    deadg = np.zeros(n * n + 1, dtype=np.bool_)
     stack = np.zeros(n * n, dtype=np.int32)
-    next_gid = 1
-    for r in range(n):
-        for c in range(n):
-            color = board[r, c]
-            if color == 0 or color == HOLE or labels[r, c] != 0:
-                continue
-            gid = next_gid
-            next_gid += 1
-            top = 0
-            stack[top] = r * n + c
-            top += 1
-            labels[r, c] = gid
-            while top > 0:
-                top -= 1
-                cur = stack[top]
-                cr = cur // n
-                cc = cur % n
-                gsize[gid] += 1
-                if cr > 0:
-                    nb = board[cr - 1, cc]
-                    if nb == 0:
-                        pos = (cr - 1) * n + cc
-                        if lib_seen[pos] != gid:
-                            lib_seen[pos] = gid
-                            lib[gid] += 1
-                    elif nb == color and labels[cr - 1, cc] == 0:
-                        labels[cr - 1, cc] = gid
-                        stack[top] = (cr - 1) * n + cc
-                        top += 1
-                if cr < n - 1:
-                    nb = board[cr + 1, cc]
-                    if nb == 0:
-                        pos = (cr + 1) * n + cc
-                        if lib_seen[pos] != gid:
-                            lib_seen[pos] = gid
-                            lib[gid] += 1
-                    elif nb == color and labels[cr + 1, cc] == 0:
-                        labels[cr + 1, cc] = gid
-                        stack[top] = (cr + 1) * n + cc
-                        top += 1
-                if cc > 0:
-                    nb = board[cr, cc - 1]
-                    if nb == 0:
-                        pos = cr * n + (cc - 1)
-                        if lib_seen[pos] != gid:
-                            lib_seen[pos] = gid
-                            lib[gid] += 1
-                    elif nb == color and labels[cr, cc - 1] == 0:
-                        labels[cr, cc - 1] = gid
-                        stack[top] = cr * n + (cc - 1)
-                        top += 1
-                if cc < n - 1:
-                    nb = board[cr, cc + 1]
-                    if nb == 0:
-                        pos = cr * n + (cc + 1)
-                        if lib_seen[pos] != gid:
-                            lib_seen[pos] = gid
-                            lib[gid] += 1
-                    elif nb == color and labels[cr, cc + 1] == 0:
-                        labels[cr, cc + 1] = gid
-                        stack[top] = cr * n + (cc + 1)
-                        top += 1
-    for r in range(n):
-        for c in range(n):
-            if board[r, c] == 0 or board[r, c] == HOLE:
-                continue
-            gid = labels[r, c]
-            out[r, c] = (gsize[gid] <= 2) or (lib[gid] <= 1)
+
+    for _pass in range(n * n):
+        labels[:, :] = 0
+        # ⚠️ lib_seen 必须每轮清零：组号每轮都从 1 重新分配，印记残留会让本轮
+        # 的 gid 撞上上一轮同号的印记，把已有的气当成「已数过」→ 气数被少算，
+        # 大块会被误判成「气 <= 1」整片清掉。
+        lib_seen[:] = 0
+        lib[:] = 0
+        gsize[:] = 0
+        gdiag[:] = False
+        elib[:] = 0
+        eseen[:] = 0
+        deadg[:] = False
+        next_gid = 1
+        # ---------- 1) 分组：大小、气、斜对角接应 ----------
+        for r in range(n):
+            for c in range(n):
+                color = work[r, c]
+                if color == 0 or color == HOLE or labels[r, c] != 0:
+                    continue
+                gid = next_gid
+                next_gid += 1
+                top = 0
+                stack[top] = r * n + c
+                top += 1
+                labels[r, c] = gid
+                while top > 0:
+                    top -= 1
+                    cur = stack[top]
+                    cr = cur // n
+                    cc = cur % n
+                    gsize[gid] += 1
+                    if not gdiag[gid]:
+                        if (cr > 0 and cc > 0 and work[cr - 1, cc - 1] == color) or \
+                           (cr > 0 and cc < n - 1 and work[cr - 1, cc + 1] == color) or \
+                           (cr < n - 1 and cc > 0 and work[cr + 1, cc - 1] == color) or \
+                           (cr < n - 1 and cc < n - 1 and work[cr + 1, cc + 1] == color):
+                            gdiag[gid] = True
+                    if cr > 0:
+                        nb = work[cr - 1, cc]
+                        if nb == 0:
+                            pos = (cr - 1) * n + cc
+                            if lib_seen[pos] != gid:
+                                lib_seen[pos] = gid
+                                lib[gid] += 1
+                        elif nb == color and labels[cr - 1, cc] == 0:
+                            labels[cr - 1, cc] = gid
+                            stack[top] = (cr - 1) * n + cc
+                            top += 1
+                    if cr < n - 1:
+                        nb = work[cr + 1, cc]
+                        if nb == 0:
+                            pos = (cr + 1) * n + cc
+                            if lib_seen[pos] != gid:
+                                lib_seen[pos] = gid
+                                lib[gid] += 1
+                        elif nb == color and labels[cr + 1, cc] == 0:
+                            labels[cr + 1, cc] = gid
+                            stack[top] = (cr + 1) * n + cc
+                            top += 1
+                    if cc > 0:
+                        nb = work[cr, cc - 1]
+                        if nb == 0:
+                            pos = cr * n + (cc - 1)
+                            if lib_seen[pos] != gid:
+                                lib_seen[pos] = gid
+                                lib[gid] += 1
+                        elif nb == color and labels[cr, cc - 1] == 0:
+                            labels[cr, cc - 1] = gid
+                            stack[top] = cr * n + (cc - 1)
+                            top += 1
+                    if cc < n - 1:
+                        nb = work[cr, cc + 1]
+                        if nb == 0:
+                            pos = cr * n + (cc + 1)
+                            if lib_seen[pos] != gid:
+                                lib_seen[pos] = gid
+                                lib[gid] += 1
+                        elif nb == color and labels[cr, cc + 1] == 0:
+                            labels[cr, cc + 1] = gid
+                            stack[top] = cr * n + (cc + 1)
+                            top += 1
+        # ---------- 2) 每个块紧邻敌块的最大气数 ----------
+        for r in range(n):
+            for c in range(n):
+                gid = labels[r, c]
+                if gid == 0:
+                    continue
+                for d in range(4):
+                    nr = r + (-1 if d == 0 else (1 if d == 1 else 0))
+                    nc = c + (-1 if d == 2 else (1 if d == 3 else 0))
+                    if nr < 0 or nr >= n or nc < 0 or nc >= n:
+                        continue
+                    eg = labels[nr, nc]
+                    if eg == 0 or eg == gid:
+                        continue
+                    if eseen[eg] != gid:
+                        eseen[eg] = gid
+                        if lib[eg] > elib[gid]:
+                            elib[gid] = lib[eg]
+        # ---------- 3) 判定（先全部判定，再统一移除） ----------
+        for r in range(n):
+            for c in range(n):
+                gid = labels[r, c]
+                if gid == 0 or deadg[gid]:
+                    continue
+                if lib[gid] <= 1:
+                    deadg[gid] = True              # 只剩一气：优先级最高，直接清
+                elif not gdiag[gid] and gsize[gid] <= 2:
+                    deadg[gid] = True              # 1-2 子孤子：直接清
+                elif not gdiag[gid] and gsize[gid] <= 5:
+                    deadg[gid] = elib[gid] >= 3    # 3-5 子孤子：敌块有 3 气才清，否则双活
+                else:
+                    deadg[gid] = False
+        removed = 0
+        for r in range(n):
+            for c in range(n):
+                gid = labels[r, c]
+                if gid > 0 and deadg[gid]:
+                    out[r, c] = True
+                    work[r, c] = 0
+                    removed += 1
+        if removed == 0:
+            break
 
 
 @njit(cache=True)
@@ -1083,43 +1405,135 @@ def _regions_and_colors(board, n, max_c, r_label, r_size, r_has_b, r_has_w):
 
 
 class GoGame:
-    """numba 加速版围棋（API 与 Python 版完全一致）"""
+    """numba 加速版围棋（API 与 Python 版完全一致）
 
-    def __init__(self, board_size=BOARD_SIZE, komi=KOMI, hollow=0):
+    形状只有一个来源：`self.hole_mask`（(n,n) bool，True = 不能落子）。
+    居中方块洞只是 `hollow` 这个便捷写法生成的一种掩码；心形、圆环、
+    多个洞直接传 `hole_mask` 即可，规则层不做任何区分。
+    """
+
+    def __init__(self, board_size=BOARD_SIZE, komi=KOMI, hole_mask=None,
+                 start_board=None):
         self.board_size = int(board_size)
-        self.komi = float(komi)
-        self.hollow = validate_hollow(self.board_size, hollow)
+        # 贴目只要求 0.5 粒度（整数合法）：终局目差 = 整数 - 贴目。
+        self.komi = validate_komi(komi)
         n = self.board_size
-        h = self.hollow
-        self._hole_lo = (n - h) // 2 if h else n
-        self._hole_hi = self._hole_lo + h if h else n
-        self._boundary = boundary_plane(n, h)
+        self.hole_mask = shapes.validate_mask(
+            shapes.solid(n) if hole_mask is None else hole_mask, n)
+        # 自定义开局：直接摆好黑白子，永远黑先；空盘(None)就是普通开局
+        self._start_stones = shapes.validate_stones(start_board, self.hole_mask, n)
+        self._boundary = boundary_plane_from_mask(self.hole_mask)
         self._simulate_mode = False
         self.reset()
 
     def reset(self):
         n = self.board_size
-        rules = board_rules(n, self.hollow)
+        rules = board_rules_for_area(shapes.playable_area(self.hole_mask))
         self.board = np.zeros((n, n), dtype=np.int8)
-        if self.hollow:
-            self.board[self._hole_lo:self._hole_hi, self._hole_lo:self._hole_hi] = HOLE
-        # [13:15] 当前局面 Zobrist 哈希，[15:17] 上一局面哈希；
-        # [17] 全历史局面条数。劫判定使用全历史（位置超级劫）。
-        self._st = np.zeros(19, dtype=np.int32)
+        self.board[self.hole_mask] = HOLE
+        # [0]当前方 [1]/[2]上一手 [3]手数 [4]连续pass [5]winner(-2=未定)
+        # [6]/[7] min_moves/max_moves
+        # [8:10] 当前局面 Zobrist 哈希，[10] 全历史局面条数（位置超级劫）
+        # [11]/[12] 黑白子数 [13]/[14] 黑白累计提子（增量维护，全局特征直接读）
+        self._st = np.zeros(15, dtype=np.int32)
         self._st[0] = 1                    # 当前玩家
         self._st[1] = -2                   # 上一步 r（-2=None）
         self._st[2] = -2
-        self._st[3] = -2                   # 劫点 r
-        self._st[4] = -2
-        self._st[9] = -2                   # winner（-2=None）
-        self._st[10] = rules["min_moves"]  # 前 N 手不允许 pass
-        self._st[11] = rules["max_moves"]  # 单局最大手数
-        self._st[12] = rules["pass_limit"] # 单方累计 pass 上限
-        self._st[17] = 1                   # 历史里已有空盘
+        self._st[5] = -2                   # winner（-2=None）
+        self._st[6] = rules["min_moves"]   # 前 N 手不允许 pass
+        self._st[7] = rules["max_moves"]   # 单局最大手数
+        self._st[10] = 1                   # 历史里已有空盘
         self._hist = np.zeros(rules["max_moves"] + 2, dtype=np.uint64)
         self._go = np.zeros(1, dtype=np.bool_)
         self._fp = np.zeros(1, dtype=np.float64)
         self._cap = np.zeros(self.board_size * self.board_size, dtype=np.int32)
+        if getattr(self, "_start_stones", None) is not None:
+            self._apply_start(self._start_stones)
+
+    def _apply_start(self, stones):
+        """把自定义开局的棋子摆上盘，并重建哈希/历史。
+
+        与 setup_handicap 不同：这里黑白都有，且无论双方子数多少，
+        **永远黑先**（用户约定：开局摆子只是局面，不是让子）。
+        """
+        n = self.board_size
+        st = np.asarray(stones, dtype=np.int8)
+        self.board[st == 1] = 1
+        self.board[st == -1] = -1
+        self._check_start_legal(st)
+        self._st[11] = int(np.count_nonzero(self.board == 1))
+        self._st[12] = int(np.count_nonzero(self.board == -1))
+        self._st[0] = 1                    # 黑先
+        self._st[1] = self._st[2] = -2
+        self._st[3] = 0
+        self._st[4] = 0
+        h = _board_hash(self.board, n)
+        _set_hash_slots(self._st, h)
+        self._hist[0] = h
+        self._st[10] = 1
+
+    def _check_start_legal(self, stones):
+        """开局局面合法性：不允许有「一口气都没有」的棋块。"""
+        n = self.board_size
+        b = self.board
+        seen = np.zeros((n, n), dtype=bool)
+        for r in range(n):
+            for c in range(n):
+                if b[r, c] == 0 or b[r, c] == HOLE or seen[r, c]:
+                    continue
+                color = b[r, c]
+                cells = []
+                stack = [(r, c)]
+                seen[r, c] = True
+                libs = 0
+                while stack:
+                    cr, cc = stack.pop()
+                    cells.append((cr, cc))
+                    for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nr, nc = cr + dr, cc + dc
+                        if not (0 <= nr < n and 0 <= nc < n):
+                            continue
+                        v = b[nr, nc]
+                        if v == 0:
+                            libs += 1
+                        elif v == color and not seen[nr, nc]:
+                            seen[nr, nc] = True
+                            stack.append((nr, nc))
+                if libs == 0:
+                    raise ValueError(
+                        "开局不合法：(%d,%d) 所在的%s棋块没有气"
+                        % (r, c, "黑" if color == 1 else "白"))
+
+    def setup_handicap(self, points):
+        """让子：把黑子直接摆上盘，白先走（不走 make_move 的黑白轮转）。
+
+        让子只进回放、不生成训练样本；贴 0 目由调用方（selfplay）在建局时决定。
+        摆完必须重算盘面哈希并重建历史 —— 否则超级劫会拿「空盘」的历史去比对。
+        返回实际摆上的子数。
+        """
+        n = self.board_size
+        placed = 0
+        last = None
+        for r, c in points:
+            r, c = int(r), int(c)
+            if not (0 <= r < n and 0 <= c < n):
+                continue
+            if self.board[r, c] != 0:
+                continue
+            self.board[r, c] = 1           # 让子永远给黑
+            self._st[11] += 1
+            self._st[3] += 1
+            placed += 1
+            last = (r, c)
+        if not placed:
+            return 0
+        h = _board_hash(self.board, n)
+        _set_hash_slots(self._st, h)
+        self._hist[0] = h
+        self._st[10] = 1
+        self._st[0] = -1                   # 白先走
+        self._st[1], self._st[2] = last
+        return placed
 
     # ---- 属性（与 Python 版同名同语义）----
     @property
@@ -1144,33 +1558,20 @@ class GoGame:
             self._st[1], self._st[2] = int(v[0]), int(v[1])
 
     @property
-    def ko_point(self):
-        if self._st[3] == -2:
-            return None
-        return (int(self._st[3]), int(self._st[4]))
-
-    @ko_point.setter
-    def ko_point(self, v):
-        if v is None:
-            self._st[3] = self._st[4] = -2
-        else:
-            self._st[3], self._st[4] = int(v[0]), int(v[1])
-
-    @property
     def move_count(self):
-        return int(self._st[5])
+        return int(self._st[3])
 
     @move_count.setter
     def move_count(self, v):
-        self._st[5] = int(v)
+        self._st[3] = int(v)
 
     @property
     def pass_count(self):
-        return int(self._st[6])
+        return int(self._st[4])
 
     @pass_count.setter
     def pass_count(self, v):
-        self._st[6] = int(v)
+        self._st[4] = int(v)
 
     @property
     def game_over(self):
@@ -1182,11 +1583,11 @@ class GoGame:
 
     @property
     def winner(self):
-        return None if self._st[9] == -2 else int(self._st[9])
+        return None if self._st[5] == -2 else int(self._st[5])
 
     @winner.setter
     def winner(self, v):
-        self._st[9] = -2 if v is None else int(v)
+        self._st[5] = -2 if v is None else int(v)
 
     @property
     def final_points(self):
@@ -1197,30 +1598,32 @@ class GoGame:
         self._fp[0] = float(v)
 
     # ---- 热路径（numba）----
-    def forced_pass(self):
-        if self._st[0] == 1:
-            return self._st[8] >= self._st[12]
-        return self._st[7] >= self._st[12]
-
     def is_legal_move(self, row, col):
         if self._go[0]:
             return False
         if (row, col) == PASS_MOVE:
-            return self._st[5] >= self._st[10]
+            # pass 只受 min_moves 限制；没有 pass 上限，落子永远不被 pass 计数阻塞
+            return self._st[3] >= self._st[6]
         n = self.board_size
         if not (0 <= row < n and 0 <= col < n):
             return False
-        if self.forced_pass():
-            return False
-        cur_h, prev_h = _hash_from_slots(self._st)
+        cur_h = _hash_from_slots(self._st)
         hist_n = _sync_history(self._st, self._hist, cur_h)
         return _is_legal_impl(self.board, row, col, self._st[0],
-                              self._st[3], self._st[4], cur_h, prev_h,
-                              True, self.board_size, self._hist, hist_n)
+                              cur_h, self.board_size, self._hist, hist_n)
 
     def make_move(self, row, col, check_legal=False):
         if check_legal and not self.is_legal_move(row, col):
             return False
+        if (row, col) != PASS_MOVE:
+            n = self.board_size
+            # 越界坐标会被 numpy 负索引回绕成"另一端的点"，重叠落子会直接覆盖
+            # 已有棋子。两者都会把盘面和 Zobrist 哈希一起写坏，而 _make_move
+            # 仍然返回 True。挡在 numba 入口前，成本是一次比较。
+            if not (0 <= row < n and 0 <= col < n):
+                return False
+            if self.board[row, col] != 0:
+                return False
         ok = _make_move(self.board, self._st, self._go, self._fp,
                         row, col, self._cap, self._hist)
         if not ok:
@@ -1272,8 +1675,13 @@ class GoGame:
             player = self._st[0]
         n = self.board_size
         out = np.zeros((INPUT_CHANNELS, n, n), dtype=np.float32)
-        _canonical_state(self.board, self._st, n, self.komi, int(player), out,
+        own_ladder = np.zeros((n, n), dtype=np.float32)
+        opp_ladder = np.zeros((n, n), dtype=np.float32)
+        _canonical_state(self.board, self._st, n, int(player), out,
                          self._boundary)
+        _ladder_channels(self.board, n, int(player), own_ladder, opp_ladder)
+        out[CH_OWN_LADDER] = own_ladder
+        out[CH_OPP_LADDER] = opp_ladder
         if legal_mask is None:
             if int(player) == int(self._st[0]):
                 legal_mask = self.get_legal_mask()
@@ -1292,6 +1700,38 @@ class GoGame:
         out[CH_LEGAL_MASK] = legal_mask[:n * n].reshape(n, n)
         return out
 
+    def get_global_features(self, player=None):
+        """当前玩家视角的全局特征向量（与空间输入分离）。
+
+        数量类特征统一归一化到 [-1,1]：``2*count/可落子面积 - 1``。
+        棋子数与提子数是增量维护的（见 _make_move），这里只做读取和缩放，
+        不扫棋盘 —— 这函数在 MCTS 每个叶子上都要跑。
+        """
+        if player is None:
+            player = self._st[0]
+        p = int(player)
+        area = float(self.playable_area)
+        st = self._st
+        own = float(st[11] if p == 1 else st[12])
+        opp = float(st[12] if p == 1 else st[11])
+        own_cap = float(st[13] if p == 1 else st[14])
+        opp_cap = float(st[14] if p == 1 else st[13])
+        out = np.zeros((GLOBAL_DIM,), dtype=np.float32)
+        out[G_KOMI] = np.float32(p * self.komi / KOMI_SCALE)
+        out[G_OWN_STONES] = np.float32(2.0 * own / area - 1.0)
+        out[G_OPP_STONES] = np.float32(2.0 * opp / area - 1.0)
+        out[G_OWN_CAPS] = np.float32(min(1.0, max(-1.0, 10.0 * own_cap / area - 1.0)))
+        out[G_OPP_CAPS] = np.float32(min(1.0, max(-1.0, 10.0 * opp_cap / area - 1.0)))
+        out[G_AREA] = np.float32(area / 361.0 - 1.0)
+        return out
+
+    def get_state_bundle(self, player=None, legal_mask=None):
+        """一次生成 (空间状态, 全局向量)，保证两者使用同一个 player。"""
+        if player is None:
+            player = self._st[0]
+        state = self.get_canonical_state(player=player, legal_mask=legal_mask)
+        return state, self.get_global_features(player=player)
+
 
     def is_hole(self, row, col):
         n = self.board_size
@@ -1299,26 +1739,22 @@ class GoGame:
                 and self.board[row, col] == HOLE)
 
     @property
-    def hole_lo(self):
-        return int(self._hole_lo)
-
-    @property
-    def hole_hi(self):
-        return int(self._hole_hi)
-
-    @property
     def valid_mask(self):
         """可落子点掩码（洞为 False；内外边界都算可落子）。"""
         return self._boundary >= 0.0
+
+    @property
+    def playable_area(self):
+        return int((~self.hole_mask).sum())
 
     def copy(self):
         g = GoGame.__new__(GoGame)
         g.board_size = self.board_size
         g.komi = self.komi
-        g.hollow = self.hollow
-        g._hole_lo = self._hole_lo
-        g._hole_hi = self._hole_hi
-        g._boundary = self._boundary.copy()
+        # 形状与边界平面在整局里都不变：共享引用而不是逐次深拷贝。
+        # MCTS 每次模拟都会 copy 一次，省掉两份 n² 数组。
+        g.hole_mask = self.hole_mask
+        g._boundary = self._boundary
         g.board = self.board.copy()
         g._st = self._st.copy()
         g._hist = self._hist.copy()
@@ -1326,6 +1762,8 @@ class GoGame:
         g._fp = self._fp.copy()
         g._cap = np.zeros(self.board_size * self.board_size, dtype=np.int32)
         g._simulate_mode = False
+        # 开局棋子不随对局变化，共享引用即可；漏掉它会让「悔棋后重来」炸在 reset()
+        g._start_stones = self._start_stones
         return g
 
     # ---- 以下冷路径沿用纯 Python（只在终局/复盘时调用，不影响速度）----
@@ -1352,15 +1790,15 @@ class GoGame:
         返回绝对归属图 own(H,W int8)。"""
         data = self._merged_analysis()
         self._fp[0] = float(data['final_diff'])
-        self._st[9] = 1 if data['final_diff'] > 0 else (-1 if data['final_diff'] < 0 else 0)
+        self._st[5] = 1 if data['final_diff'] > 0 else (-1 if data['final_diff'] < 0 else 0)
         return data['own']
 
     def _merged_analysis(self):
         """终局领地/归属分析：所有棋子算活，只对空区域做 flood fill。
 
         只挨黑=黑地、只挨白=白地、两种都挨=中立（归属 0，目数黑白各 0.5，
-        目差中相互抵消）。数目之前可选移除「子数 <= 2」或「独立气数 == 1」
-        的残块，避免终局死子污染标签。
+        目差中相互抵消）。数目之前按 `_dead_lump_mask` 的规则移除死子
+        （孤子 + 紧邻敌块气数 >= 3；或独立气数 <= 1），避免终局死子污染标签。
         """
         board = self.board
         n = self.board_size

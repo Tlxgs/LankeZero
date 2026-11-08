@@ -7,13 +7,13 @@ import argparse
 import time
 
 import numpy as np
-import torch
 
 from model import PolicyValueNet
 from evaluator import GoEvaluator
 from game import GoGame
 from mcts import MCTS
-from hyperparams import BOARD_SIZES, INPUT_CHANNELS, CH_BOUNDARY, MODEL_PATH
+from hyperparams import (BOARD_SIZES, INPUT_CHANNELS, GLOBAL_DIM,
+                         CH_BOUNDARY, MODEL_PATH)
 
 
 def main():
@@ -34,17 +34,18 @@ def main():
     n = args.board_size
     x = np.zeros((args.batch, INPUT_CHANNELS, n, n), dtype=np.float32)
     x[:, 0, 3, 3] = 1.0
-    x[:, 6] = 1.0
+    x[:, 5] = 1.0
     x[:, CH_BOUNDARY, 0, :] = 1.0
     x[:, CH_BOUNDARY, n - 1, :] = 1.0
     x[:, CH_BOUNDARY, :, 0] = 1.0
     x[:, CH_BOUNDARY, :, n - 1] = 1.0
+    g = np.zeros((args.batch, GLOBAL_DIM), dtype=np.float32)
     mask = np.ones((args.batch, n * n + 1), dtype=np.float32)
     for _ in range(3):
-        ev.evaluate(x, mask)
+        ev.evaluate(x, mask, g)
     t = time.time()
     for _ in range(args.repeats):
-        ev.evaluate(x, mask)
+        ev.evaluate(x, mask, g)
     infer = (time.time() - t) / args.repeats
     print("inference batch=%d graph=%s: %.4f s/batch (%.1f pos/s)"
           % (args.batch, ev._graph_enabled, infer, args.batch / infer))

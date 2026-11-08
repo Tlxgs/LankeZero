@@ -7,19 +7,21 @@ from tkinter import ttk, messagebox
 import numpy as np
 import ctypes
 ctypes.windll.shcore.SetProcessDpiAwareness(1)
-from game import GoGame, PASS_MOVE
+from game import PASS_MOVE
 from mcts import MCTS
 from ui_utils import GameBoard
+from rules_adapter import GO_RULES
 
-from hyperparams import (BOARD_SIZE, BOARD_SIZES, MODEL_PATH, KOMI, MCTS_CAP,
+from hyperparams import (MCTS_CAP,
                          GUI_MAX_SIMS, NUM_SIMULATIONS, C_PUCT,
                          BATCH_SIZE_MCTS,
                          GUI_TEMPERATURE as TEMPERATURE,
                          GUI_SIMS_PER_TICK as SIMS_PER_TICK,
                          GUI_STEP_MS as STEP_MS,
-                         CANDIDATE_MASS, MIN_CANDIDATES,
                          GUI_DEBUG as DEBUG, GUI_CRASH_LOG as CRASH_LOG,
-                         GUI_CRASH_NATIVE_LOG, hollow_choices, validate_hollow)
+                         GUI_CRASH_NATIVE_LOG)
+
+import shapes
 
 try:
     faulthandler.enable(open(GUI_CRASH_NATIVE_LOG, 'a', buffering=1))
@@ -34,41 +36,42 @@ def _board_cell(board_size):
     return 60 if int(board_size) <= 19 else 48
 
 
-def _resolve_model_path():
-    """全项目唯一权重：model.pt（路径由 hyperparams 指向仓库根目录）。"""
-    return MODEL_PATH
-
-
-class GomokuGUI:
-    def __init__(self, device='cuda'):
-        self.board_size = BOARD_SIZE
-        self.hollow = 0
-        self.komi = KOMI
+class GameGUI:
+    """对弈界面。棋种差异全部由 rules.ui 的能力开关决定（见 rules_adapter.UISpec）。"""
+    def __init__(self, device='cuda', rules=None):
+        self.rules = rules or GO_RULES
+        self.ui = self.rules.ui
+        self.board_size = self.ui.default_size
+        self.shape_name = "整盘"
+        self.hole_mask = shapes.solid(self.board_size)
+        self.start_stones = None          # 自定义开局的棋子（None = 空盘）
+        self.komi = self.rules.komi
         self.device = device
-        self.game = GoGame(board_size=BOARD_SIZE, komi=self.komi, hollow=self.hollow)
-        self.model_path = _resolve_model_path()
+        self.game = self.rules.new_game(self.board_size, self.hole_mask, self.komi)
+        self.model_path = self.ui.model_path
         print('[GUI] 正在初始化本地推理引擎: %s' % self.model_path)
         try:
             from model import PolicyValueNet
             from trt_engine import make_evaluator
             model = PolicyValueNet.load_model(self.model_path, device=device)
             evaluator = make_evaluator(
-                model, board_size=BOARD_SIZE, device=device,
+                model, board_size=self.board_size, device=device,
                 max_batch=BATCH_SIZE_MCTS, use_tensorrt=True,
+                trt_engine_dir=self.ui.trt_engine_dir,
                 log=lambda msg: print(msg, flush=True))
             self.model = model
             self.evaluator = evaluator
             self.mcts = MCTS(evaluator=evaluator, c_puct=C_PUCT,
                              num_simulations=NUM_SIMULATIONS,
                              temperature=TEMPERATURE,
-                             device=device, board_size=BOARD_SIZE,
-                             dirichlet_epsilon=0, cap=_gui_cap(BOARD_SIZE),
-                             candidate_mass=CANDIDATE_MASS,
-                             min_candidates=MIN_CANDIDATES)
+                             device=device, board_size=self.board_size,
+                             alpha=self.ui.default_alpha,
+                             dirichlet_epsilon=0, cap=_gui_cap(self.board_size),
+                             rules=self.rules)
         except Exception as e:
             msg = (f"模型初始化失败，GUI 无法启动：\n{type(e).__name__}: {e}\n\n"
                    "请检查：\n"
-                   "1) 权重是否存在，且是当前 10 通道架构（旧 9 通道会自动迁移）\n"
+                   "1) 权重是否存在，且是当前 KataGo-lite 架构（空间 11 通道 + 全局 1 维）\n"
                    f"   当前路径: {self.model_path}\n"
                    "2) PyTorch CUDA 是否可用（也可用 --device cpu）\n"
                    "3) 显存是否被其他进程占用")
@@ -99,9 +102,6 @@ class GomokuGUI:
         self.cpuct_var = tk.DoubleVar(value=C_PUCT)
         self.temp_var = tk.DoubleVar(value=TEMPERATURE)
         self.alpha_var = tk.DoubleVar(value=self.mcts.alpha)   # MCTS保守系数（可运行时调整）
-        # 子节点候选裁剪：先验累计质量 + 最少保留数
-        self.candidate_mass_var = tk.DoubleVar(value=self.mcts.candidate_mass)
-        self.min_candidates_var = tk.IntVar(value=self.mcts.min_candidates)
         # 虚拟损失：并行搜索时给"这一批正在走的路径"临时加访问罚，避免一批模拟全挤同一分支
         self.vloss_var = tk.IntVar(value=self.mcts.vloss)
         # 根节点 Dirichlet 噪声：ε 是混合比例、α 是噪声浓度（两者不是一回事）。默认 ε=0
@@ -119,8 +119,6 @@ class GomokuGUI:
             ("虚拟损失:", self.vloss_var, 0, 20, 1),
             ("温度:", self.temp_var, 0.0, 2.0, 0.1),
             ("α:", self.alpha_var, 0.0, 1.0, 0.05),
-            ("候选质量:", self.candidate_mass_var, 0.5, 1.0, 0.005),
-            ("最少候选:", self.min_candidates_var, 1, 64, 1),
             ("噪声 ε:", self.dir_eps_var, 0.0, 1.0, 0.05),
             ("噪声 α:", self.dir_alpha_var, 0.001, 1.0, 0.01),
         ]
@@ -131,33 +129,36 @@ class GomokuGUI:
                         textvariable=var, width=8).grid(row=i, column=1, pady=3)
 
         row = len(params)  # 现有参数行数
-        ttk.Label(ctrl, text="贴目:").grid(row=row, column=0, sticky="w", pady=3)
-        self.komi_var = tk.DoubleVar(value=KOMI)
-        ttk.Spinbox(ctrl, from_=-21, to=21.0, increment=0.5,
-                    textvariable=self.komi_var, width=8).grid(row=row, column=1, pady=3)
+        if self.ui.allow_komi:
+            ttk.Label(ctrl, text="贴目:").grid(row=row, column=0, sticky="w", pady=3)
+            self.komi_var = tk.DoubleVar(value=self.komi)
+            ttk.Spinbox(ctrl, from_=-21, to=21.0, increment=0.5,
+                        textvariable=self.komi_var, width=8).grid(row=row, column=1, pady=3)
+            row += 1
 
-        row += 1
         ttk.Label(ctrl, text="棋盘:").grid(row=row, column=0, sticky="w", pady=3)
         self.board_size_var = tk.IntVar(value=self.board_size)
         board_cb = ttk.Combobox(ctrl, textvariable=self.board_size_var,
-                                values=BOARD_SIZES, state="readonly", width=12)
+                                values=self.ui.board_sizes, state="readonly", width=12)
         board_cb.grid(row=row, column=1, pady=3)
         board_cb.bind("<<ComboboxSelected>>", self._on_board_size_change)
 
-        row += 1
-        ttk.Label(ctrl, text="镂空:").grid(row=row, column=0, sticky="w", pady=3)
-        self.hollow_var = tk.IntVar(value=self.hollow)
-        self.hollow_cb = ttk.Combobox(ctrl, textvariable=self.hollow_var,
-                                      values=hollow_choices(self.board_size),
-                                      state="readonly", width=12)
-        self.hollow_cb.grid(row=row, column=1, pady=3)
-        self.hollow_cb.bind("<<ComboboxSelected>>", self._on_hollow_change)
+        if self.ui.allow_shape:
+            row += 1
+            ttk.Label(ctrl, text="形状:").grid(row=row, column=0, sticky="w", pady=3)
+            self.shape_label = ttk.Label(ctrl, text="整盘", width=12)
+            self.shape_label.grid(row=row, column=1, sticky="w", pady=3)
+            row += 1
+            ttk.Button(ctrl, text="编辑形状", command=self._on_shape_change).grid(
+                row=row, column=0, columnspan=2, sticky="ew", pady=2)
 
         row += 1
         ttk.Label(ctrl, text="显示:").grid(row=row, column=0, sticky="w", pady=3)
+        modes = ["对弈棋盘", "MCTS统计", "策略网络概率"]
+        if self.ui.show_ownership:
+            modes.append("领地归属")
         mode_cb = ttk.Combobox(ctrl, textvariable=self.mode_var,
-                               values=["对弈棋盘", "MCTS统计", "策略网络概率", "领地归属"],
-                               state="readonly", width=12)
+                               values=modes, state="readonly", width=12)
         mode_cb.grid(row=row, column=1, pady=3)
         mode_cb.bind("<<ComboboxSelected>>", lambda _: self._draw())
 
@@ -180,9 +181,10 @@ class GomokuGUI:
         row += 1
         ttk.Button(ctrl, text="重置游戏", command=self._reset) \
             .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
-        row += 1
-        ttk.Button(ctrl, text="弃权 (Pass)", command=self._human_pass) \
-            .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
+        if self.ui.show_pass:
+            row += 1
+            ttk.Button(ctrl, text="弃权 (Pass)", command=self._human_pass) \
+                .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
         row += 1
         ttk.Button(ctrl, text="退出", command=self.root.quit) \
             .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
@@ -201,21 +203,25 @@ class GomokuGUI:
                                    font=('微软雅黑', 12))
         self.win_label.pack()
 
-        # 目差显示
-        row += 1
-        score_frame = ttk.LabelFrame(ctrl, text="启发式目差估值", padding=5)
-        score_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
-        self.score_label = ttk.Label(score_frame, text="",
-                                     font=('微软雅黑', 12))
-        self.score_label.pack()
+        # 目差显示（围棋专有）
+        self.score_label = None
+        if self.ui.show_score:
+            row += 1
+            score_frame = ttk.LabelFrame(ctrl, text="启发式目差估值", padding=5)
+            score_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
+            self.score_label = ttk.Label(score_frame, text="",
+                                         font=('微软雅黑', 12))
+            self.score_label.pack()
 
         # === 领地目差显示 (Value Net 归属头) ===
-        row += 1
-        territory_frame = ttk.LabelFrame(ctrl, text="领地网络估值", padding=5)
-        territory_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
-        self.territory_label = ttk.Label(territory_frame, text="",
-                                         font=('微软雅黑', 12))
-        self.territory_label.pack()
+        self.territory_label = None
+        if self.ui.show_ownership:
+            row += 1
+            territory_frame = ttk.LabelFrame(ctrl, text="领地网络估值", padding=5)
+            territory_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
+            self.territory_label = ttk.Label(territory_frame, text="",
+                                             font=('微软雅黑', 12))
+            self.territory_label.pack()
 
         # === 胜率头估值（网络直接输出；与"综合估值"不同：后者是 MCTS 搜索值）===
         row += 1
@@ -230,7 +236,7 @@ class GomokuGUI:
                                 bg="#D1D1D1", highlightthickness=0)
         self.canvas.grid(row=0, column=1, padx=5, pady=10)
         self.board = GameBoard(self.canvas, self.board_size, self.cell_size,
-                               self.margin, hollow=self.hollow)
+                               self.margin, hole_mask=self.hole_mask)
         self.canvas.bind("<Button-1>", self._on_click)
 
         # 搜索状态（单线程，无锁）
@@ -243,6 +249,8 @@ class GomokuGUI:
 
         # 当前胜率头输出（当前玩家视角胜率 ∈[0,1]；None = 该模型无胜率头/输出异常）
         self.current_win_prob = None
+
+        # 分数头目差（当前执棋方视角的期望目差与标准差）
 
         self.black_weighted = 0
         self.white_weighted = 0
@@ -331,6 +339,17 @@ class GomokuGUI:
         except Exception as e:
             self._log_exception(type(e), e, e.__traceback__)
 
+    def _rebuild_tree_and_search(self):
+        """重建搜索根 → 刷新估值 → 重画 → 重启搜索。
+
+        悔棋、重置、改参数、换棋盘全都以这四步收尾（原来这段被复制了 5 份，
+        每份的异常路径各写各的，于是有几处改完参数后忘了重启搜索，界面就
+        停在「参数已改、树已废、搜索链断」的状态里）。
+        """
+        self._init_mcts()
+        self._draw()
+        self._start_search()
+
     # ---------------- 绘制 ----------------
 
     def _draw(self):
@@ -350,9 +369,11 @@ class GomokuGUI:
         self._draw_winrate()
         bw = self.black_weighted if hasattr(self, 'black_weighted') else 0
         ww = self.white_weighted if hasattr(self, 'white_weighted') else 0
-        self.territory_label.config(
-            text=f"黑棋: {bw-ww:+.2f}"
-        )
+        # 领地网络（归属头逐点求和）就是目差估计：黑白点数差再减掉贴目
+        if self.territory_label is not None:
+            self.territory_label.config(
+                text=f"黑棋: {bw-ww-float(self.game.komi):+.1f} 目"
+            )
         # 胜率头：网络直接输出（未过搜索）。模型给的是"当前执棋方"胜率，要换算成黑棋视角
         p_cur = getattr(self, 'current_win_prob', None)
         if p_cur is None:
@@ -430,15 +451,20 @@ class GomokuGUI:
         best = max(stats, key=lambda s: s[3] if is_policy else s[1])[0]
         for m, vis, wr, prob in stats:
             if is_policy:
-                self.board.draw_stat_circle(m[0], m[1], prob, max_val,
+                # 概率按当前盘面最大值归一化后再上色，否则低先验全落在色带同一端
+                rel = prob / max_val if max_val > 0 else 0.0
+                self.board.draw_stat_circle(m[0], m[1], rel,
                                             f"{prob*100:.1f}%")
             elif vis:
-                self.board.draw_stat_circle(m[0], m[1], wr, max_val,
+                # 胜率本身就是 0..1，直接上色（不能再除以 max，否则 50% 会被画成满格）
+                self.board.draw_stat_circle(m[0], m[1], wr,
                                             f"{wr*100:.1f}\n{vis}")
         self.board.draw_best_circle(*best)
 
     def _draw_pass_info(self, children):
         """在棋盘下方显示 Pass 的先验概率与搜索次数"""
+        if not self.ui.show_pass:
+            return
         if PASS_MOVE in children:
             ch = children[PASS_MOVE]
             info = (f"Pass: 先验 {ch.prior_prob*100:.1f}%"
@@ -482,6 +508,8 @@ class GomokuGUI:
 
     def _update_score_diff(self):
         """每次落子后计算并显示盘面目差（调用 game.compute_score）"""
+        if self.score_label is None:
+            return
         black_score, white_score, diff = self.game.compute_score()
         self.score_label.config(text=f"黑棋: {diff:+.1f} ")
 
@@ -490,10 +518,11 @@ class GomokuGUI:
         """更新 Value Net 估值 + 归属图 + 目差估计"""
         try:
             _, legal_mask = self.game.get_legal_moves_and_mask()
-            state = self.game.get_canonical_state(legal_mask=legal_mask)
-            policy, _, ownership_view, win_logit_view = self.mcts.model.get_policy_value_ownership(
-                state, legal_mask, device=self.mcts.device
-            )
+            state, gfeat = self.game.get_state_bundle(legal_mask=legal_mask)
+            policy, value_view, ownership_view, win_logit_view = \
+                self.mcts.model.get_policy_value_ownership(
+                    state, legal_mask, device=self.mcts.device, global_features=gfeat
+                )
             # 转换为绝对归属（黑=1，白=-1）；NaN/Inf 清洗 + 形状校验
             if ownership_view is not None and ownership_view.shape == (self.board_size, self.board_size):
                 own = np.asarray(ownership_view, dtype=np.float64)
@@ -507,8 +536,8 @@ class GomokuGUI:
                 self.current_win_prob = (1.0 + float(np.tanh(win_logit_view))) / 2.0
             else:
                 self.current_win_prob = None
-            
-            # 计算领地目差
+
+            # 计算领地目差（归属头逐点求和；贴目在黑棋视角里扣掉，见 _draw）
             if self.current_ownership is not None:
                 own = self.current_ownership
                 # 正=黑，负=白
@@ -549,11 +578,17 @@ class GomokuGUI:
         return self.white_auto_var.get()
 
     def _on_auto_toggle(self):
-        """勾选自动落子：若当前搜索已完成且轮到对应方，立即触发一次 AI 落子；
-        搜索未完成则由 _search_step 在完成时自动触发。"""
+        """勾选自动落子：若搜索已完成且轮到对应方，立即触发一次 AI 落子；
+        搜索未完成则由 _search_step 在完成时自动触发。
+
+        必须再查一次 _auto_move_enabled()：两个复选框共用一个回调，轮到白棋时
+        勾「黑棋自动落子」不该让白棋立刻自己走一手。
+        """
         if self.game.game_over:
             return
         if self._sim_count < self.mcts.num_simulations:
+            return
+        if not self._auto_move_enabled():
             return
         self._ai_move()
 
@@ -580,15 +615,8 @@ class GomokuGUI:
         self._search_gen += 1                 # 作废进行中的搜索
         self.game = self._history.pop()       # 恢复落子前局面
         self.game.komi = self.komi            # 保持当前贴目设置一致
-        try:
-            self.mcts.root = None
-            self.mcts.init_root(self.game)        # 重建搜索树根（1次推理）
-            self._update_score_diff()
-            self._update_current_value()          # 悔棋后更新估值+归属
-            self._draw()
-            self._start_search()
-        except Exception as e:
-            self._log_exception(type(e), e, e.__traceback__)
+        self._update_score_diff()
+        self._rebuild_tree_and_search()       # 悔棋后重建树根 + 刷估值 + 重启搜索
 
     def _do_move(self, r, c):
         if self.game.game_over:
@@ -640,17 +668,8 @@ class GomokuGUI:
         # 都以 _start_search 收尾；mcts 内部按「待混标记」保证一个根只混一次，故无脑调即可 ——
         # 根没变时是空操作，ε=0 时直接短路。
         self.mcts.mix_root_noise()
-        # 合法 pass 至少探一次，避免「pass 就赢」因先验太低被 PUCT 饿死。
-        # probe 的访问计入本手总模拟数：GUI 和 selfplay 都是 num_simulations，
-        # 不再像以前那样 probe 之后又跑满 N 次（N+1）。
-        root = self.mcts.root
-        before = root.visit_count if root is not None else 0
-        self.mcts.probe_pass(self.game)
-        root = self.mcts.root
-        after = root.visit_count if root is not None else 0
-        probe_visits = max(0, after - before)
         self._search_gen += 1
-        self._sim_count = min(probe_visits, self.mcts.num_simulations)
+        self._sim_count = 0
         gen = self._search_gen
         self.root.after(STEP_MS, lambda: self._search_step(gen))
 
@@ -669,8 +688,15 @@ class GomokuGUI:
         # min(batch_size, remaining) 截回小批，「推理batch」控件就成了摆设（改了没反应）。
         batch_n = min(max(SIMS_PER_TICK, self.mcts.batch_size), n - self._sim_count)
         try:
-            self.mcts.simulate_batch(self.game.copy(), batch_n)
-            self._sim_count += batch_n
+            done = self.mcts.simulate_batch(self.game.copy(), batch_n)
+            if not done:
+                # 根不存在（init_root 失败过）或一次都没跑成。绝不能照加
+                # _sim_count —— 那会让搜索「瞬间完成」，然后拿空树选点，
+                # AI 连走两个 Pass 直接认输，而且只留一行日志。
+                if DEBUG:
+                    print("[GUI] 搜索未能推进（搜索树为空），本手停止搜索")
+                return
+            self._sim_count += done
             self._draw()
         except Exception as e:
             # 搜索异常不崩：记录日志并停止本轮搜索（避免每 10ms 重复刷屏）
@@ -680,6 +706,59 @@ class GomokuGUI:
 
     # ---------------- 参数 / 重置 ----------------
 
+    def _restart_board(self, size, hole_mask, shape_name, komi, stones=None):
+        """按 (尺寸, 形状/开局, 贴目) 重建对局、推理器、搜索树，并重启搜索。
+
+        切换尺寸和切换形状共用这一份逻辑。关键是「先全部构造成功、再提交」：
+        原来是边改 self.* 边构造，make_evaluator / MCTS 抛异常就直接 return，
+        留下「棋盘已换、mcts 还是旧尺寸、搜索链已作废」的半初始化状态，
+        之后坐标取点和悔棋都会错位。
+
+        stones 是自定义开局的棋子（(n,n) int8，1 黑 / -1 白）；None = 空盘。
+        开局摆子**永远黑先**，与子数多少无关（见 GoGame._apply_start）。
+        """
+        hole_mask = shapes.validate_mask(hole_mask, size)
+        stones = shapes.validate_stones(stones, hole_mask, size)
+        try:
+            game = self.rules.new_game(size, hole_mask, komi, start_board=stones)
+            from trt_engine import make_evaluator
+            evaluator = make_evaluator(
+                self.model, board_size=size, device=self.device,
+                max_batch=BATCH_SIZE_MCTS, use_tensorrt=True,
+                trt_engine_dir=self.ui.trt_engine_dir,
+                log=lambda msg: print(msg, flush=True))
+            old = self.mcts
+            mcts = MCTS(evaluator=evaluator,
+                        c_puct=old.c_puct, num_simulations=old.num_simulations,
+                        temperature=old.temperature, alpha=old.alpha,
+                        dirichlet_alpha=old.dirichlet_alpha,
+                        dirichlet_epsilon=old.dirichlet_epsilon,
+                        board_size=size, batch_size=old.batch_size,
+                        cap=_gui_cap(size),
+                        fpu_reduction=old.fpu_reduction,
+                        virtual_loss=old.vloss, rules=self.rules)
+        except Exception as e:
+            messagebox.showerror("切换失败", "%s: %s" % (type(e).__name__, e))
+            return False
+        self._search_gen += 1
+        self.board_size, self.hole_mask, self.shape_name, self.komi = \
+            size, hole_mask, shape_name, komi
+        self.start_stones = stones
+        self.game = game
+        self.evaluator = evaluator
+        self.mcts = mcts
+        self.cell_size, self.margin = _board_cell(size), 60
+        self.canvas_size = (size - 1) * self.cell_size + 2 * self.margin
+        self.canvas.config(width=self.canvas_size, height=self.canvas_size)
+        self.board = GameBoard(self.canvas, size, self.cell_size, self.margin,
+                               hole_mask=hole_mask)
+        self.shape_label.config(text=shape_name)
+        self.root.title(self._window_title())
+        self._history.clear()
+        self._update_score_diff()
+        self._rebuild_tree_and_search()
+        return True
+
     def _on_board_size_change(self, event=None):
         n = int(self.board_size_var.get())
         if n == self.board_size:
@@ -688,83 +767,36 @@ class GomokuGUI:
             if not messagebox.askyesno("切换棋盘", "切换棋盘会重置当前对局，继续？"):
                 self.board_size_var.set(self.board_size)
                 return
-        self._search_gen += 1
-        self.board_size = n
-        h = int(self.hollow)
-        if h > n - 4:
-            h = 0
-        self.hollow = h
-        self.hollow_cb["values"] = hollow_choices(n)
-        self.hollow_var.set(h)
         try:
-            self.komi = float(self.komi_var.get())
+            komi = float(self.komi_var.get()) if self.ui.allow_komi else self.rules.komi
         except Exception:
-            self.komi = KOMI
-        self.game = GoGame(board_size=n, komi=self.komi, hollow=self.hollow)
-        self.cell_size, self.margin = _board_cell(n), 60
-        self.canvas_size = (n - 1) * self.cell_size + 2 * self.margin
-        self.canvas.config(width=self.canvas_size, height=self.canvas_size)
-        self.board = GameBoard(self.canvas, n, self.cell_size, self.margin,
-                               hollow=self.hollow)
-        old = self.mcts
-        try:
-            from trt_engine import make_evaluator
-            self.evaluator = make_evaluator(
-                self.model, board_size=n, device=self.device,
-                max_batch=BATCH_SIZE_MCTS, use_tensorrt=True,
-                log=lambda msg: print(msg, flush=True))
-        except Exception as e:
-            messagebox.showerror("推理引擎切换失败", "%s: %s" % (type(e).__name__, e))
-            return
-        self.mcts = MCTS(evaluator=self.evaluator,
-                         c_puct=old.c_puct, num_simulations=old.num_simulations,
-                         temperature=old.temperature, alpha=old.alpha,
-                         dirichlet_alpha=old.dirichlet_alpha,
-                         dirichlet_epsilon=old.dirichlet_epsilon,
-                         candidate_mass=self.candidate_mass_var.get(),
-                         min_candidates=int(self.min_candidates_var.get()),
-                         board_size=n, batch_size=old.batch_size,
-                         cap=_gui_cap(n),
-                         fpu_reduction=old.fpu_reduction,
-                         virtual_loss=old.vloss)
-        self.root.title(self._window_title())
-        self._history.clear()
-        self._update_score_diff()
-        self._init_mcts()
-        self._draw()
-        self._start_search()
+            komi = self.rules.komi
+        # 换尺寸后旧形状的掩码对不上，退回整盘
+        if not self._restart_board(n, shapes.solid(n), "整盘", komi):
+            self.board_size_var.set(self.board_size)
 
-    def _on_hollow_change(self, event=None):
-        h = int(self.hollow_var.get())
-        if h == self.hollow:
-            return
-        try:
-            h = validate_hollow(self.board_size, h)
-        except ValueError as exc:
-            messagebox.showerror("镂空非法", str(exc))
-            self.hollow_var.set(self.hollow)
-            return
+    def _on_shape_change(self, event=None):
         if self.game.move_count > 0:
-            if not messagebox.askyesno("切换镂空", "切换镂空会重置当前对局，继续？"):
-                self.hollow_var.set(self.hollow)
+            if not messagebox.askyesno("切换形状", "切换形状会重置当前对局，继续？"):
                 return
-        self._search_gen += 1
-        self.hollow = h
-        self.game = GoGame(board_size=self.board_size, komi=self.komi,
-                           hollow=self.hollow)
-        self.board = GameBoard(self.canvas, self.board_size, self.cell_size,
-                               self.margin, hollow=self.hollow)
-        self.root.title(self._window_title())
-        self._history.clear()
-        self._update_score_diff()
-        self._init_mcts()
-        self._draw()
-        self._start_search()
+        try:
+            import shape_editor
+            mask, stones, _name = shape_editor.edit_shape(
+                self.root, self.board_size, self.hole_mask, self.start_stones)
+        except Exception as e:
+            self._log_exception(type(e), e, e.__traceback__)
+            return
+        if mask is None:
+            return
+        name = "整盘" if (not mask.any() and stones is None) else "自定义"
+        self._restart_board(self.board_size, mask, name, self.komi, stones)
 
     def _window_title(self):
-        hollow = (" 镂空%d" % self.hollow) if self.hollow else ""
-        return "围棋 AI - %d路%s - %s" % (
-            self.board_size, hollow, os.path.basename(self.model_path))
+        shape = "" if self.shape_name in ("整盘", "") else " " + self.shape_name
+        if not self.ui.allow_shape:
+            shape = ""
+        return "%s AI - %d路%s - %s" % (
+            self.ui.title, self.board_size, shape, os.path.basename(self.model_path))
 
     def _apply_params(self):
         self._search_gen += 1
@@ -796,14 +828,6 @@ class GomokuGUI:
             self.mcts.alpha = float(self.alpha_var.get())
         except Exception:
             self.alpha_var.set(self.mcts.alpha)
-        try:
-            self.mcts.candidate_mass = min(1.0, max(0.5, float(self.candidate_mass_var.get())))
-        except Exception:
-            self.candidate_mass_var.set(self.mcts.candidate_mass)
-        try:
-            self.mcts.min_candidates = max(1, int(self.min_candidates_var.get()))
-        except Exception:
-            self.min_candidates_var.set(self.mcts.min_candidates)
         # 根噪声：下面 init_root 会把待混标记置位，收尾那次 _start_search 就按新值混入，
         # 所以改完 ε/α 不用手动重置搜索树。
         try:
@@ -814,15 +838,16 @@ class GomokuGUI:
             self.mcts.dirichlet_alpha = float(self.dir_alpha_var.get())
         except Exception:
             self.dir_alpha_var.set(self.mcts.dirichlet_alpha)
-        try:
-            new_komi = float(self.komi_var.get())
-        except Exception:
-            new_komi = self.komi
-            self.komi_var.set(self.komi)
-        if new_komi != self.komi:
-            self.komi = new_komi
-            self.game.komi = new_komi  # 更新当前游戏的贴目
-            self._update_score_diff()   # 更新显示
+        if self.ui.allow_komi:
+            try:
+                new_komi = float(self.komi_var.get())
+            except Exception:
+                new_komi = self.komi
+                self.komi_var.set(self.komi)
+            if new_komi != self.komi:
+                self.komi = new_komi
+                self.game.komi = new_komi  # 更新当前游戏的贴目
+                self._update_score_diff()   # 更新显示
         try:
             self.mcts.root = None
             self.mcts.init_root(self.game)
@@ -830,23 +855,26 @@ class GomokuGUI:
             self._draw()
             self._start_search()
         except Exception as e:
+            # 参数已经写进 mcts 了，但树没建起来 —— 至少把搜索链恢复，
+            # 否则自动落子会静默失效，只能手动点「AI 落子」。
             self._log_exception(type(e), e, e.__traceback__)
+            try:
+                self._rebuild_tree_and_search()
+            except Exception as e2:
+                self._log_exception(type(e2), e2, e2.__traceback__)
 
     def _reset(self):
         self._search_gen += 1
         self._history.clear()
         self.game.reset()
         self.game.komi = self.komi
-        try:
-            self.mcts.root = None
-            self.mcts.init_root(self.game)
-            self._update_score_diff()
-            self._update_current_value()   # 重置后更新估值+归属
-            self._draw()
-            self._start_search()
-        except Exception as e:
-            self._log_exception(type(e), e, e.__traceback__)
+        self._update_score_diff()
+        self._rebuild_tree_and_search()
+
+
+# 旧名字保留：历史代码/测试里有引用。
+GomokuGUI = GameGUI
 
 
 if __name__ == "__main__":
-    GomokuGUI()
+    GameGUI()

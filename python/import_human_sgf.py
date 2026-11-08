@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from game import GoGame
-from hyperparams import PROJECT_ROOT, KOMI
+from hyperparams import PROJECT_ROOT, is_half_step_komi
 from replay import pack_game, payload_arrays, state_to_sample
 
 
@@ -209,6 +209,10 @@ def read_sgf(path, min_moves, max_moves):
     komi = norm_komi(get_prop(root, "KM", ""))
     if komi is None or not np.isfinite(komi) or komi < 0.0 or komi > 100.0:
         raise SkipGame("bad_komi")
+    # 贴目必须是 x.5：整数贴目（大量让子局/老棋谱是 0）会让终局目差落到
+    # 分数头两个箱之间，整局直接不要。
+    if not is_half_step_komi(komi):
+        raise SkipGame("komi_not_half")
     winner, score_diff = parse_result(get_prop(root, "RE", ""))
     if winner is None:
         raise SkipGame("no_result")
@@ -247,7 +251,7 @@ def make_payload(meta, board_size=19):
         policy = np.zeros(total, dtype=np.float32)
         policy[n * n if (r < 0 or c < 0) else r * n + c] = 1.0
         samples.append(state_to_sample(
-            state, policy, game.current_player, game.last_move, game.ko_point))
+            state, policy, game.current_player, game.last_move))
         game.make_move(r, c)
         played.append((r, c, expected))
     if len(samples) < 20:
@@ -259,7 +263,7 @@ def make_payload(meta, board_size=19):
                 raise SkipGame("ended_early")
     own = np.zeros((n, n), dtype=np.int8)
     return pack_game(samples, played, meta["winner"], meta["score_diff"], own,
-                     board_size=n, komi=meta["komi"], hollow=0, own_mask=0)
+                     board_size=n, komi=meta["komi"], own_mask=0)
 
 
 def game_hash(meta):

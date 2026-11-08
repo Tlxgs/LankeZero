@@ -1,59 +1,92 @@
+"""KataGo-lite policy/value/ownership network.
+
+Input contract
+--------------
+``x``: (B, INPUT_CHANNELS, n, n) spatial planes.  These contain only
+*spatially varying* features; komi/rules/global scalars are **not** planes.
+``g``: (B, GLOBAL_DIM) global vector.  Today GLOBAL_DIM == 1 (signed komi),
+but every layer reads the dimension from the config so it can grow later.
+
+Output contract is unchanged:
+``policy`` (B, n*n+1), ``value`` (B, 1), ``ownership_raw`` (B, 1, n, n),
+``win_logit`` (B, 1).
+
+The trunk follows KataGo's main ideas: 5x5 stem, pre-activation residual
+blocks, global-pooling bias in only a few blocks, and 1x1 policy/value heads
+with a global bias.  It is fully convolutional and has no size-specific
+parameters, so 7..23 and hollow boards use the same weights.
+"""
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
-# ---- 推理/训练性能优化（全局生效）----
-torch.backends.cudnn.benchmark = True 
+from hyperparams import (BOARD_SIZE, INPUT_CHANNELS, GLOBAL_DIM,
+                         CHANNELS, HEAD_CHANNELS, NUM_RES_BLOCKS,
+                         INPUT_KERNEL, GPOOL_BLOCKS, DROPOUT_RATE,
+                         CH_BOUNDARY, GLOBAL_INIT_STD)
+
+# Inference/training performance flags (global, same as before).
+torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
-
-# 超参数（统一配置见 hyperparams.py）
-from hyperparams import (BOARD_SIZE, INPUT_CHANNELS, CHANNELS, HEAD_CHANNELS, NUM_RES_BLOCKS,
-                         DROPOUT_RATE, CH_BOUNDARY)
 
 
 class GlobalPoolBias(nn.Module):
-    """全盘统计量 → 逐通道偏置 → 广播回每个空间位置（KataGo 的 gpool，论文第二强技巧 1.60×）。
+    """KataGo-style global-pooling bias: mean+max -> FC -> per-channel bias.
 
-    统计量只取 **mean + max** 两个：棋盘固定 19 路，KataGo 第三个「按尺寸缩放的均值」是为跨
-    9~19 路泛化用的，对我们是纯冗余（见 AGENT.md 的 KataGo 对照表）。
-
-    为什么以前不能用：旧归一化用「减逐通道均值」，会把逐通道常数偏置的**共同部分**抵消掉
-    （实测梯度被压小约 100 倍），而推理时又不抵消 ⇒ 训推不一致。换成跨通道求 RMS 的
-    RMSNorm 后没有减均值这一步，加性偏置的梯度路径才通（_dl/_check_gpool_grad.py 可复验）。
-
-    末层零初始化 ⇒ 初始输出与不接本模块时**逐位相同** ⇒ 旧权重可无痛续训。梯度不会因此
-    断掉：这是残差加法，主路径的梯度不经过 fc，而 fc 自身的梯度 ∝ 上游梯度 × 池化统计量，
-    两者都非零。注意与「末层零初始化会把前层梯度掐断」那种情形不同 —— 那种是**唯一通路**
-    被断开，这里只是旁路初值为零。
+    The last FC is zero-initialized, so the module starts as identity and the
+    trunk can learn to use global context without destabilizing early training.
+    ``pool_channels`` allows pooling a prefix of channels (KataGo's cpool).
     """
 
-    def __init__(self, channels, hidden=None):
+    def __init__(self, channels, hidden=None, pool_channels=None):
         super().__init__()
-        h = hidden or max(1, channels // 4)
-        self.fc1 = nn.Linear(2 * channels, h)
+        self.pool_channels = int(pool_channels or channels)
+        self.full_pool = (self.pool_channels == int(channels))
+        h = int(hidden or max(8, channels // 4))
+        self.fc1 = nn.Linear(2 * self.pool_channels, h)
         self.fc2 = nn.Linear(h, channels)
         nn.init.zeros_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        b, c = x.shape[0], x.shape[1]
-        s = torch.cat([x.mean(dim=(2, 3)), x.amax(dim=(2, 3))], dim=1)   # (B, 2C)
-        return x + self.fc2(F.relu(self.fc1(s))).view(b, c, 1, 1)
+        # Avoid a channel Slice when the whole tensor is pooled: TensorRT 8.x
+        # rejects Slice nodes whose axes are not constant in a dynamic-batch graph.
+        g = x if self.full_pool else x[:, :self.pool_channels]
+        s = torch.cat([g.mean(dim=(2, 3)), g.amax(dim=(2, 3))], dim=1)
+        return x + self.fc2(F.relu(self.fc1(s))).view(x.shape[0], -1, 1, 1)
+
+
+class GlobalFeatureBias(nn.Module):
+    """Global vector -> per-channel bias, broadcast over the board.
+
+    This is the *only* path for komi/rules.  Keeping it separate from ``x``
+    means a future vector (komi parity, rules, board-size scalars, ...) only
+    changes GLOBAL_DIM and the encoder, never the spatial channel layout.
+    """
+
+    def __init__(self, global_dim, channels, hidden=None):
+        super().__init__()
+        h = int(hidden or max(8, channels // 4))
+        self.fc1 = nn.Linear(int(global_dim), h)
+        self.fc2 = nn.Linear(h, channels)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, g):
+        return self.fc2(F.relu(self.fc1(g))).view(g.shape[0], -1, 1, 1)
 
 
 class RMSNorm2d(nn.Module):
-    """LayerNorm 风格的 RMSNorm：跨 (C,H,W) 求均方根，逐通道仿射。
+    """Global RMSNorm over (C,H,W), per-channel affine.
 
-    刻意**不**按通道求 RMS —— 那等价于 InstanceNorm，会把「整通道同一个常数」在归一化那一步
-    抹掉。跨通道求 RMS 时，单通道的常数只与整体尺度竞争，不会被单独消掉。
-
-    没有 running 统计量 ⇒ 训练与推理行为一致（不存在两套统计量的差异）。
+    Kept from the previous architecture: no running statistics, so training and
+    inference use exactly the same normalization, and a per-channel constant
+    bias (e.g. from gpool) is not removed as it would be by InstanceNorm.
     """
 
     def __init__(self, num_features, eps=1e-5):
         super().__init__()
-        self.num_features = num_features
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(num_features))
         self.bias = nn.Parameter(torch.zeros(num_features))
@@ -63,136 +96,167 @@ class RMSNorm2d(nn.Module):
         return x / rms * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, channels, dropout_rate):
+def _make_norm(channels):
+    return RMSNorm2d(channels)
+
+
+class PreActResBlock(nn.Module):
+    """Pre-activation residual block, identity skip (no 1x1 bottleneck)."""
+
+    def __init__(self, channels, gpool=False, dropout_rate=0.0):
         super().__init__()
-        self.norm1 = RMSNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.norm2 = RMSNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bottleneck = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.norm_bottle = RMSNorm2d(channels)
-        self.dropout = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else nn.Identity()
-        self.gpool = GlobalPoolBias(channels)
+        self.norm1 = _make_norm(channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.gpool = GlobalPoolBias(channels) if gpool else None
+        self.norm2 = _make_norm(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        # Bake the 0.5 residual scale into conv2's initialization instead of a
+        # runtime `x + 0.5*y`.  A standalone 0.5 constant becomes a TensorRT
+        # CONSTANT weight, and REFIT then demands that constant on every refit.
+        with torch.no_grad():
+            self.conv2.weight.mul_(0.5)
+        self.dropout = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else None
 
     def forward(self, x):
-        res = x
-        out = self.norm1(x)
-        out = F.leaky_relu(out)
-        out = self.conv1(out)
-        out = self.norm2(out)
-        out = F.leaky_relu(out)
-        out = self.conv2(out)
-        res = self.bottleneck(res)
-        res = self.norm_bottle(res)
-        out = self.dropout(out)
-        out = res + out
-        # 放在残差相加之后：偏置进入残差流，交给后续层去扩散利用（KataGo 也是加进 block 输出）。
-        # 不在归一化「之前」注入，是为了让偏置少被归一化一次。
-        return self.gpool(out)
+        y = F.relu(self.norm1(x))
+        y = self.conv1(y)
+        if self.gpool is not None:
+            y = self.gpool(y)
+        y = F.relu(self.norm2(y))
+        y = self.conv2(y)
+        if self.dropout is not None:
+            y = self.dropout(y)
+        return x + y
 
 
 class PolicyValueNet(nn.Module):
+    FORMAT_VERSION = 13
+    ARCHITECTURE = 'go-katago-lite-v11'
+
     def __init__(self, board_size=BOARD_SIZE, input_channels=INPUT_CHANNELS,
-                 channels=CHANNELS, num_res_blocks=NUM_RES_BLOCKS,
-                 head_channels=None, dropout_rate=DROPOUT_RATE):
+                 global_dim=GLOBAL_DIM, channels=CHANNELS,
+                 num_res_blocks=NUM_RES_BLOCKS, head_channels=None,
+                 dropout_rate=DROPOUT_RATE, input_kernel=INPUT_KERNEL,
+                 gpool_blocks=GPOOL_BLOCKS, boundary_channel=None):
         super().__init__()
-        self.board_size = board_size
-        self.channels = channels
-        self.num_res_blocks = num_res_blocks
-        self.head_channels = head_channels if head_channels else HEAD_CHANNELS
-        self.dropout_rate = dropout_rate
-        self.input_channels = input_channels
+        self.board_size = int(board_size)
+        self.input_channels = int(input_channels)
+        self.global_dim = int(global_dim)
+        # 哪一路是「边界/有效点」通道（go=8）。只用来屏蔽洞里的归属输出；
+        # 其他棋种（五子棋）把它放在自己的通道位置，没有洞时该通道恒 >= 0。
+        self.boundary_channel = int(CH_BOUNDARY if boundary_channel is None
+                                    else boundary_channel)
+        self.channels = int(channels)
+        self.num_res_blocks = int(num_res_blocks)
+        self.num_blocks = self.num_res_blocks
+        self.head_channels = int(head_channels or HEAD_CHANNELS)
+        self.dropout_rate = float(dropout_rate)
+        self.input_kernel = int(input_kernel)
+        self.gpool_blocks = tuple(int(i) for i in gpool_blocks)
 
-        # 输入卷积
-        self.conv_input = nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False)
-        self.norm_input = RMSNorm2d(channels)
+        pad = self.input_kernel // 2
+        self.conv_input = nn.Conv2d(self.input_channels, self.channels,
+                                    self.input_kernel, padding=pad, bias=False)
+        self.global_bias = GlobalFeatureBias(self.global_dim, self.channels)
+        # 全局特征的**直连残差**：out += g @ W。线性层的梯度与自身权重无关，
+        # 所以用正常小随机初始化即可，不需要靠 0 初始化来保持恒等 ——
+        # 初始幅度很小（std=GLOBAL_INIT_STD），对主干的影响可忽略。
+        self.global_skip = nn.Linear(self.global_dim, self.channels, bias=False)
+        nn.init.normal_(self.global_skip.weight, std=float(GLOBAL_INIT_STD))
 
-        # 残差块
-        self.res_blocks = nn.ModuleList([
-            ResBlock(channels, dropout_rate) for _ in range(num_res_blocks)
+        gp = set(self.gpool_blocks)
+        self.blocks = nn.ModuleList([
+            PreActResBlock(self.channels, gpool=(i + 1) in gp,
+                           dropout_rate=self.dropout_rate)
+            for i in range(self.num_blocks)
         ])
+        self.norm_out = _make_norm(self.channels)
 
-        # ---------- 三个头（KataGo 风格轻量塔）----------
-        # 共享头塔：归属头与胜率头共用第一层 3×3 卷积（对应 KataGo ownership/value head 共用 conv tower）
-        self.head_conv = nn.Conv2d(channels, self.head_channels, kernel_size=3, padding=1, bias=False)
-        self.head_norm = RMSNorm2d(self.head_channels)
+        # ---------------- 统一头部（三个头） ----------------
+        # 一个共享 1x1 头塔把主干 128 通道变成同宽的 128 通道头特征，三个头读同一份
+        # 特征。全局偏置只保留一条低秩支路 head_bias1/2(p0)，先加进头特征再 norm。
+        # 每个头都是同一种形式的读出：
+        #   policy : pol_h 1x1 128->48 -> pol_out 1x1 48->1（每点 1 logit）+ pol_pass(p)
+        #   own    : own_h 1x1 128->48 -> own_out 1x1 48->1 + own_global(p)
+        #   win    : p ->128 ->64 ->1
+        self.head_width = int(self.channels)
+        hw = self.head_width
+        self.head_conv = nn.Conv2d(self.channels, hw, 1, bias=False)
+        self.head_norm = _make_norm(hw)
+        self.head_bias1 = nn.Linear(2 * hw, hw // 2)
+        self.head_bias2 = nn.Linear(hw // 2, hw)
 
-        # 策略头（独立 2 层 3×3 塔）：逐点 logit + 全局池化 pass logit
-        self.policy_conv = nn.Conv2d(channels, self.head_channels, kernel_size=3, padding=1, bias=False)
-        self.policy_norm = RMSNorm2d(self.head_channels)
-        self.policy_conv2 = nn.Conv2d(self.head_channels, self.head_channels, kernel_size=3, padding=1, bias=False)
-        self.policy_norm2 = RMSNorm2d(self.head_channels)
-        self.conv_policy_out = nn.Conv2d(self.head_channels, 1, kernel_size=1, bias=True)
-        self.fc_policy_pass = nn.Linear(self.head_channels, 1, bias=True)
+        ro = hw // 2                                # 每点读出宽度：64（128 时）
+        self.pol_h = nn.Conv2d(hw, ro, 1, bias=False)
+        self.pol_out = nn.Conv2d(ro, 1, 1, bias=True)
+        self.pol_pass = nn.Linear(2 * hw, 1)
 
-        # 归属头（共享塔 + 1 层加深；KataGo：逐点本地归属 + 全局偏置）
-        self.own_conv = nn.Conv2d(self.head_channels, self.head_channels, kernel_size=3, padding=1, bias=False)
-        self.own_norm = RMSNorm2d(self.head_channels)
-        self.conv_own_out = nn.Conv2d(self.head_channels, 1, kernel_size=1, bias=True)
-        self.fc_own_global = nn.Linear(self.head_channels, 1, bias=True)
+        self.own_h = nn.Conv2d(hw, ro, 1, bias=False)
+        self.own_out = nn.Conv2d(ro, 1, 1, bias=True)
+        self.own_global = nn.Linear(2 * hw, 1)
 
-        # 胜率头（共享塔 + 1 层加深；全局平均池化 → 2 层 MLP → 胜率 logit）
-        self.win_conv = nn.Conv2d(self.head_channels, self.head_channels, kernel_size=3, padding=1, bias=False)
-        self.win_norm = RMSNorm2d(self.head_channels)
-        self.win_fc1 = nn.Linear(self.head_channels, self.head_channels, bias=True)
-        self.win_fc2 = nn.Linear(self.head_channels, 1, bias=True)
+        self.win_fc1 = nn.Linear(2 * hw, hw)
+        self.win_fc2 = nn.Linear(hw, hw // 2)
+        self.win_fc3 = nn.Linear(hw // 2, 1)
 
-    def forward(self, x):
-        # 共享特征
-        out = F.leaky_relu(self.norm_input(self.conv_input(x)))
-        for res in self.res_blocks:
-            out = res(out)
 
-        # ---------- 策略头（独立 2 层 3×3 塔）----------
-        policy = F.leaky_relu(self.policy_norm(self.policy_conv(out)))                  # (B, HEAD_CHANNELS, H, W)
-        policy = F.leaky_relu(self.policy_norm2(self.policy_conv2(policy)))             # (B, HEAD_CHANNELS, H, W)
-        policy_spatial = self.conv_policy_out(policy).reshape(policy.size(0), -1)  # (B, 361) 逐点 logit
-        policy_pass = self.fc_policy_pass(                                      # (B, 1) pass logit（全局池化）
-            F.adaptive_avg_pool2d(policy, 1).flatten(1))
-        policy = torch.cat([policy_spatial, policy_pass], dim=1)                # (B, 362)
+    def forward(self, x, g=None):
+        if g is None:
+            g = torch.zeros((x.shape[0], self.global_dim),
+                            dtype=x.dtype, device=x.device)
+        out = self.conv_input(x)
+        out = out + self.global_bias(g) + self.global_skip(g).view(-1, self.channels, 1, 1)
+        for block in self.blocks:
+            out = block(out)
+        out = F.relu(self.norm_out(out))
 
-        # ---------- 共享头塔（归属头/胜率头共用第一层，KataGo 风格）----------
-        head = F.leaky_relu(self.head_norm(self.head_conv(out)))                        # (B, HEAD_CHANNELS, H, W)
+        # ---------- 统一头部：一个共享 1x1 塔 + 一次池化 ----------
+        h = self.head_conv(out)                                   # (B,128,n,n)
+        p0 = torch.cat([h.mean(dim=(2, 3)), h.amax(dim=(2, 3))], dim=1)
+        h = F.relu(self.head_norm(h + self.head_bias2(
+            F.relu(self.head_bias1(p0))).view(-1, self.head_width, 1, 1)))
+        p = torch.cat([h.mean(dim=(2, 3)), h.amax(dim=(2, 3))], dim=1)
 
-        # ---------- 领地头（价值 = 归属求和；共享塔 + 1 层加深，本地 + 全局偏置）----------
-        own = F.leaky_relu(self.own_norm(self.own_conv(head)))                          # (B, HEAD_CHANNELS, H, W)
-        own_local = self.conv_own_out(own)                                      # (B, 1, H, W) 逐点本地归属
-        own_global = self.fc_own_global(                                        # (B, 1) 全局偏置（允许整体偏移）
-            F.adaptive_avg_pool2d(own, 1).flatten(1))
-        ownership_raw = own_local + own_global.view(-1, 1, 1, 1)                # (B, 1, H, W) 未压缩
-        # 边界通道 -1 = 洞。洞内不参与 value 求和；raw logit 不再硬置 0，
-        # 训练时把洞内目标也纳入归属损失（目标 0），让头自己学会输出 0。
-        # hollow=0 时 valid 全 1，行为与旧模型逐位一致。
-        valid = (x.select(1, CH_BOUNDARY).unsqueeze(1) >= 0.0).to(ownership_raw.dtype)
-        ownership = torch.tanh(ownership_raw) * valid                           # (B, 1, H, W)，洞内 0
-        value = ownership.sum(dim=(2, 3))                                       # (B, 1) 期望领地目差（当前视角）
+        # 策略 / 归属（空间读出）
+        p_spatial = self.pol_out(F.relu(self.pol_h(h))).reshape(h.shape[0], -1)
+        p_pass = self.pol_pass(p)
+        policy = torch.cat([p_spatial, p_pass], dim=1)
 
-        # ---------- 胜率头（共享塔 + 1 层加深；全局平均池化 → 2 层 MLP；tanh 后=当前玩家胜率 ±1，MCTS 用 logit）----------
-        win = F.leaky_relu(self.win_norm(self.win_conv(head)))                          # (B, HEAD_CHANNELS, H, W)
-        win = F.leaky_relu(self.win_fc1(F.adaptive_avg_pool2d(win, 1).flatten(1)))    # (B, HEAD_CHANNELS)
-        win_logit = self.win_fc2(win)                                           # (B, 1) logit
+        own_local = self.own_out(F.relu(self.own_h(h)))
+        own_global = self.own_global(p).view(-1, 1, 1, 1)
+        ownership_raw = own_local + own_global
+        valid = (x.select(1, self.boundary_channel).unsqueeze(1) >= 0.0).to(ownership_raw.dtype)
+        ownership = torch.tanh(ownership_raw) * valid
+        value = ownership.sum(dim=(2, 3))
 
+        # 胜率（全局读出）
+        w = F.relu(self.win_fc1(p))
+        win_logit = self.win_fc3(F.relu(self.win_fc2(w)))
         return policy, value, ownership_raw, win_logit
 
-    def get_policy_value_ownership(self, state, legal_mask=None, device='cpu'):
+    def get_policy_value_ownership(self, state, legal_mask=None, device='cpu',
+                                   global_features=None):
         self.eval()
         with torch.inference_mode():
-            state_tensor = torch.from_numpy(state).unsqueeze(0).float().to(device)
+            state_tensor = torch.from_numpy(np.asarray(state)).unsqueeze(0).float().to(device)
+            gt = None
+            if global_features is not None:
+                gt = torch.from_numpy(np.asarray(global_features)).reshape(
+                    1, self.global_dim).float().to(device)
             legal_tensor = None
             if legal_mask is not None:
-                legal_tensor = torch.from_numpy(legal_mask).float().to(device)
-            policy_logits, value, ownership, win_logit = self(state_tensor)
+                legal_tensor = torch.from_numpy(np.asarray(legal_mask)).float().to(device)
+            policy_logits, value, ownership, win_logit = self(state_tensor, gt)
             if legal_tensor is not None:
                 policy_logits = policy_logits.masked_fill(legal_tensor == 0, -1e4)
             policy = F.softmax(policy_logits, dim=1)
-            ownership = torch.tanh(ownership)                # (1,1,H,W) ∈(-1,1)
-            valid = (state_tensor[:, CH_BOUNDARY:CH_BOUNDARY + 1] >= 0.0).float()
-            ownership = ownership * valid                    # 洞内强制 0
+            ownership = torch.tanh(ownership)
+            valid = (state_tensor[:, self.boundary_channel:self.boundary_channel + 1] >= 0.0).float()
+            ownership = ownership * valid
             value = value.cpu().numpy()[0, 0]
             policy = policy.cpu().numpy()[0]
             ownership = ownership.cpu().numpy()[0, 0]
-            win_logit = float(win_logit.cpu().numpy()[0, 0])   # 胜率头 logit（tanh 后 = 当前玩家胜率 ±1）
+            win_logit = float(win_logit.cpu().numpy()[0, 0])
         return policy, value, ownership, win_logit
 
     def save_model(self, path):
@@ -202,31 +266,24 @@ class PolicyValueNet(nn.Module):
             'model_state_dict': self.state_dict(),
             'board_size': self.board_size,
             'input_channels': self.input_channels,
+            'global_dim': self.global_dim,
             'channels': self.channels,
             'head_channels': self.head_channels,
             'num_res_blocks': self.num_res_blocks,
             'dropout_rate': self.dropout_rate,
+            'input_kernel': self.input_kernel,
+            'gpool_blocks': list(self.gpool_blocks),
+            'boundary_channel': self.boundary_channel,
         }, path)
 
     def freeze_parts(self, spec):
-        """按规格冻结部分网络参数（仅训练时生效，推理/导出不受影响）。
-        spec: 逗号分隔的令牌——
-          整数 N    = res_blocks[N]（从 0 起）；
-          'gpool'   = 各残差块内的全盘偏置分支 GlobalPoolBias；
-          'own'     = 归属头（head_conv/head_norm + own_conv/own_norm + conv_own_out + fc_own_global；
-                      注意 head_conv/head_norm 为共享头塔，与胜率头共用，只冻它会让胜率头输入
-                      变成静态特征，而 win_conv/win_fc* 仍可训练）；
-          'policy'  = 策略头（policy_conv/policy_norm/policy_conv2/policy_norm2 + conv_policy_out + fc_policy_pass）；
-          'win'     = 胜率头（win_conv/win_norm + win_fc1/win_fc2，共享头塔不受影响）。
+        """Freeze a subset of parameters (training only; inference unaffected).
 
-        任一令牌带前缀 'only:' 即把整条规格切成**白名单**语义：只有列出的部分可训练，其余全冻。
-        'only:gpool' = 只训 gpool，主干与三个头一律不动（若不给前缀则恰好相反 —— 只冻 gpool）。
-
-        示例：'0,1,2,3,5,7'（冻结这些残差块）、'0,own,policy'（冻结块0+归属头+策略头）、
-        'only:gpool'（只训 gpool）。
-        未知令牌/越界序号抛 ValueError。返回冻结的参数量。"""
+        Tokens: integer N = blocks[N]; 'gpool' = all GlobalPoolBias branches;
+        'own' = value tower + ownership outputs; 'policy' = policy head;
+        'win' = win MLP.  Prefix 'only:' turns the list into an allow-list.
+        """
         names = set()
-        # gpool 嵌在每个残差块内部（res_blocks.N.gpool.*），没有顶层共同前缀，按子串认。
         substrs = []
         only = False
         if isinstance(spec, str):
@@ -240,22 +297,23 @@ class PolicyValueNet(nn.Module):
             if t == 'gpool':
                 substrs.append('.gpool.')
             elif t == 'own':
-                names.update(['head_conv', 'head_norm', 'own_conv', 'own_norm',
-                              'conv_own_out', 'fc_own_global'])
+                names.update(['own_out', 'own_global'])
             elif t == 'policy':
-                names.update(['policy_conv', 'policy_norm', 'policy_conv2', 'policy_norm2',
-                              'conv_policy_out', 'fc_policy_pass'])
+                names.update(['pol_out', 'pol_pass'])
             elif t == 'win':
-                names.update(['win_conv', 'win_norm', 'win_fc1', 'win_fc2'])
+                names.update(['win_fc1', 'win_fc2'])
+            elif t == 'head':
+                names.update(['head_conv', 'head_norm', 'head_bias1', 'head_bias2'])
             else:
                 try:
                     idx = int(t)
                 except (TypeError, ValueError):
-                    raise ValueError('未知冻结令牌 %r（支持：残差块序号 N、gpool、own、policy、win，'
-                                     '可加 only: 前缀）' % t)
-                if not (0 <= idx < len(self.res_blocks)):
-                    raise ValueError('冻结块序号 %d 越界（当前共 %d 个残差块）' % (idx, len(self.res_blocks)))
-                names.add('res_blocks.%d' % idx)
+                    raise ValueError('未知冻结令牌 %r（支持：残差块序号 N、gpool、head、own、'
+                                     'policy、win，可加 only: 前缀）' % t)
+                if not (0 <= idx < len(self.blocks)):
+                    raise ValueError('冻结块序号 %d 越界（当前共 %d 个残差块）'
+                                     % (idx, len(self.blocks)))
+                names.add('blocks.%d' % idx)
         n_frozen = 0
         for name, param in self.named_parameters():
             listed = (any(name == n or name.startswith(n + '.') for n in names)
@@ -267,10 +325,7 @@ class PolicyValueNet(nn.Module):
         return n_frozen
 
     def reset_norm(self):
-        """重新初始化全部归一化层：weight=1、bias=0。
-        归一化的 affine 缩放会被后续层抵消，对其施加 weight decay 无意义，且会持续缩小有效表达
-        （KataGo 惯例：这类 1D 参数不参与衰减）；长期训练后被衰减的可随时用本方法恢复。
-        返回重置的归一化层数。"""
+        """Reset all RMSNorm affine parameters to weight=1, bias=0."""
         n = 0
         with torch.no_grad():
             for m in self.modules():
@@ -281,65 +336,46 @@ class PolicyValueNet(nn.Module):
         print(f'[模型] 已重置 {n} 个 RMSNorm 层（weight=1, bias=0）')
         return n
 
-    FORMAT_VERSION = 2
-    ARCHITECTURE = 'go-cnn-v1'
-
     @staticmethod
     def load_model(path, device='cpu', reset_norm=False):
-        """加载当前架构，并支持从上一版 9 通道权重增量迁移到 10 通道。
-
-        新增的边界通道（CH_BOUNDARY=9）接在输入末尾：旧 9 通道权重原样复制，
-        新通道用 std=0.01 的小初始化，不破坏已有特征；数据无需改动，
-        边界通道由棋盘尺寸和 hollow 在 sample/canonical_state 里即时生成。
-        除 9→10 外，通道数或键不匹配仍直接报错。
-        """
         checkpoint = torch.load(path, map_location=device, weights_only=False)
-        sd = dict(checkpoint['model_state_dict'])
-        ckpt_in = int(checkpoint.get('input_channels', -1))
-        if ckpt_in not in (INPUT_CHANNELS, INPUT_CHANNELS - 1):
+        arch = checkpoint.get('architecture')
+        if arch != PolicyValueNet.ARCHITECTURE:
             raise ValueError(
-                f'权重输入通道 {ckpt_in} 与当前代码 {INPUT_CHANNELS} 不兼容；'
-                '只支持上一版 9 通道 → 当前 10 通道的迁移。')
-        if ckpt_in != INPUT_CHANNELS:
-            old_w = sd.get('conv_input.weight')
-            if old_w is None or old_w.shape[1] != ckpt_in:
-                raise ValueError('旧权重缺少可迁移的 conv_input.weight')
-            new_w = torch.zeros((old_w.shape[0], INPUT_CHANNELS,
-                                 old_w.shape[2], old_w.shape[3]),
-                                dtype=old_w.dtype, device=old_w.device)
-            new_w[:, :ckpt_in].copy_(old_w)
-            nn.init.normal_(new_w[:, ckpt_in:], mean=0.0, std=0.01)
-            sd['conv_input.weight'] = new_w
-            print('[模型] 已把 %d 通道 conv_input 迁移到 %d 通道，新通道 std=0.01'
-                  % (ckpt_in, INPUT_CHANNELS))
+                '权重架构 %r 与当前架构 %r 不兼容：\n%s\n'
+                '旧版 model.pt 请先用 tools/upgrade_model.py 升级；'
+                '12 通道的老模型已备份在 legacy/model_v1_12ch.pt。'
+                % (arch, PolicyValueNet.ARCHITECTURE, path))
         model = PolicyValueNet(
             board_size=checkpoint.get('board_size', BOARD_SIZE),
-            input_channels=INPUT_CHANNELS,
+            input_channels=checkpoint.get('input_channels', INPUT_CHANNELS),
+            global_dim=checkpoint.get('global_dim', GLOBAL_DIM),
             channels=checkpoint.get('channels', CHANNELS),
             num_res_blocks=checkpoint.get('num_res_blocks', NUM_RES_BLOCKS),
             head_channels=checkpoint.get('head_channels', HEAD_CHANNELS),
             dropout_rate=checkpoint.get('dropout_rate', DROPOUT_RATE),
+            input_kernel=checkpoint.get('input_kernel', INPUT_KERNEL),
+            gpool_blocks=checkpoint.get('gpool_blocks', GPOOL_BLOCKS),
+            boundary_channel=checkpoint.get('boundary_channel', CH_BOUNDARY),
         )
         try:
-            model.load_state_dict(sd, strict=True)
+            model.load_state_dict(checkpoint['model_state_dict'], strict=True)
         except RuntimeError as e:
             raise RuntimeError(
                 f'权重与当前架构不兼容：{path}\n{e}\n'
-                '除 9→10 通道迁移外，不再跳过不匹配的键。') from e
-        # 归一化层健康提示：weight decay 会持续衰减它们的 affine 缩放（KataGo 惯例：这类 1D 参数不参与衰减）。
-        # 若 mean 明显 <1（如 <0.8），说明已被衰减，建议 reset_norm=True 重置后再训练。
+                '新架构不接受旧 block/通道布局，请从当前 model.pt 重新训练。') from e
         with torch.no_grad():
             norm_means = [m.weight.data.mean().item() for m in model.modules()
                           if isinstance(m, RMSNorm2d)]
         if norm_means:
             norm_mean = float(np.mean(norm_means))
             if norm_mean < 0.8:
-                print(f'[模型] 提示: 归一化 weight 均值={norm_mean:.2f}（<0.8，疑似被 weight decay 衰减；可用 reset_norm=True 重置）')
+                print(f'[模型] 提示: 归一化 weight 均值={norm_mean:.2f}'
+                      '（<0.8，疑似被 weight decay 衰减；可用 reset_norm=True 重置）')
         if reset_norm:
             model.reset_norm()
         model.to(device)
         return model
-
 
 
 def count_parameters(model):
@@ -349,11 +385,17 @@ def count_parameters(model):
 if __name__ == "__main__":
     model = PolicyValueNet()
     print(f"参数量: {count_parameters(model):,} ({count_parameters(model)/1e6:.2f}M)")
-    print(f"结构: 输入{INPUT_CHANNELS}通道 / {CHANNELS}通道×{NUM_RES_BLOCKS}残差块")
+    print(f"结构: 空间{INPUT_CHANNELS}通道 + 全局{GLOBAL_DIM}维 / "
+          f"{CHANNELS}通道×{NUM_RES_BLOCKS}块 / gpool={GPOOL_BLOCKS}")
     x = torch.randn(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-    p, v, o, wl = model(x)
-    print(f"策略输出: {p.shape}, 价值输出: {v.shape}, 归属输出: {o.shape}, 胜率logit: {wl.shape}")
+    g = torch.randn(1, GLOBAL_DIM)
+    p, v, o, wl, sc = model(x, g)
+    print(f"策略输出: {p.shape}, 价值输出: {v.shape}, 归属输出: {o.shape}, "
+          f"胜率logit: {wl.shape}, 分数logits: {sc.shape}")
 
     state = np.random.randn(INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE).astype(np.float32)
-    policy, value, ownership, win_logit = model.get_policy_value_ownership(state)
-    print(f"策略维度: {policy.shape}, 价值: {value:.4f}, 归属: {ownership.shape}, 胜率logit: {win_logit:.4f}")
+    gv = np.zeros(GLOBAL_DIM, dtype=np.float32)
+    policy, value, ownership, win_logit = model.get_policy_value_ownership(
+        state, global_features=gv)
+    print(f"策略维度: {policy.shape}, 价值: {value:.4f}, 归属: {ownership.shape}, "
+          f"胜率logit: {win_logit:.4f}")
