@@ -73,7 +73,8 @@ class GameBoard:
                 continue
             x = self.margin + c * self.cell_size
             y = self.margin + r * self.cell_size
-            self.canvas.create_oval(x-4, y-4, x+4, y+4, fill='black', outline='black')
+            sr = max(4, int(self.cell_size * 0.07))     # 小棋盘放大后星位跟着放大
+            self.canvas.create_oval(x-sr, y-sr, x+sr, y+sr, fill='black', outline='black')
 
     def draw_piece(self, row, col, piece):
         if piece == 0 or piece == HOLE or self.is_hole(row, col):
@@ -90,7 +91,8 @@ class GameBoard:
             return None
         x = self.margin + col * self.cell_size
         y = self.margin + row * self.cell_size
-        return self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill='red', outline='red')
+        r = max(7, int(self.cell_size * 0.12))
+        return self.canvas.create_oval(x - r, y - r, x + r, y + r, fill='red', outline='red')
 
     def draw_stat_circle(self, row, col, value, text):
         """在交叉点画统计圆；value 必须是已归一化到 0..1 的量。
@@ -117,8 +119,10 @@ class GameBoard:
         color = f'#{r:02x}{g:02x}{b:02x}'
         self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
                                 fill=color, outline='')
-        self.canvas.create_text(x, y, text=text, font=('Arial', 10, 'bold'),
-                                fill='black', justify='center')
+        if text:
+            self.canvas.create_text(x, y, text=text,
+                                    font=('Arial', max(10, int(self.cell_size * 0.17)), 'bold'),
+                                    fill='black', justify='center')
 
     def draw_best_circle(self, row, col):
         if self.is_hole(row, col):

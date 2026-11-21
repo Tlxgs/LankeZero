@@ -1,16 +1,6 @@
 """统一超参数配置 —— 全项目唯一修改入口。
 
-game / mcts / model / train / train_gui / gui 都从这里取值，
-各文件不得自行定义同名常量（否则"改一个漏一个"，训练/评估/推理参数会不一致）。
 
-带 GO_ 前缀的环境变量可覆盖标了 [可覆盖] 的项，用于同一份代码在不同显存的
-机器上跑不同规模。默认值按本机 RTX 3050 Laptop 4GB 设定；更小的卡可把
-GO_BATCH / GO_MCTS_BATCH / GO_DATA_MAX 调低。
-
-手数/Pass 规则按可落子面积比例计算，写入 GoGame._st 运行时字段，
-不再有 9/13/19 的尺寸表。
-
-注释只解释"为什么"，不复述参数取值——写死的数值会在参数改动后变成谎言。
 """
 
 import hashlib
@@ -29,11 +19,6 @@ _PY_DIR = os.path.dirname(os.path.abspath(__file__))
 def _guard_numba_cache():
     """源码变过就清掉 numba 缓存（python/__pycache__）。
 
-    numba 的缓存失效依赖源码 mtime/大小；连续快速编辑时 stamp 可能碰撞，于是新进程会
-    加载**旧编译产物**：函数体里的下标/常量还是老版本。这在 2026-11 造成过
-    「_st 槽位已改成 15 个，但旧 _make_move 仍按 18 槽写 → 石子计数被写成哈希值 →
-    全局特征爆表 → 网络输出 NaN」。启动时按源码内容指纹清缓存，代价只是改代码后
-    第一次跑要重编译（~15 秒）。
     """
     try:
         h = hashlib.sha1()
@@ -78,22 +63,18 @@ def _env_float(name, default):
 
 
 # ---------------- 棋盘 / 规则 ----------------
-BOARD_SIZE = 19                    # 默认棋盘路数
-# 7–23 全尺寸（含 8/10/12/…/22）。偶数路没有正中心交叉点，形状由掩码决定，
-# 居中方块洞只是生成器里的一个快捷方式（见 shapes.centered_square）。
-BOARD_SIZES = tuple(range(7, 24))
+BOARD_SIZE = 13                    # 默认棋盘路数
+
+BOARD_SIZES = tuple(range(7, 26))   # 7–25 路
 MAX_BOARD_SIZE = max(BOARD_SIZES)
 MAX_BOARD_CELLS = MAX_BOARD_SIZE * MAX_BOARD_SIZE
 KOMI = 7.5                         # 贴目（白方补偿；所有棋盘共用，保证同一模型输入口径一致）
 PASS_MOVE = (-1, -1)               # 停一手标记
 HOLE = 3                           # 棋盘数组里的洞哨兵；0=空、1=黑、-1=白
 
-# 手数规则按可落子面积线性缩放；不再维护 9/13/19 的表格，
-# 也不再区分「实心 / 镂空」—— 形状只影响面积，比例是同一套。
-# 没有 pass 上限：pass 在 min_moves 之后随时合法（旧规则「单方累计 pass 达上限就
-# 只能 pass」会让能提子的大官子被强行 pass，2026-11 已移除）。
+
 MAX_MOVES_PER_POINT = 1.8
-MIN_MOVES_PER_POINT = 0.00
+MIN_MOVES_PER_POINT = 0.0
 
 
 def _area_round(area, ratio):
@@ -119,14 +100,7 @@ def board_rules(board_size=BOARD_SIZE):
     return board_rules_for_area(int(board_size) ** 2)
 
 
-# 终局领地判定：盘上所有子都算活 + 空区域 flood fill（Tromp-Taylor 式，
-# AlphaZero / Leela Zero 的做法）。
-# 数目之前按 `_dead_lump_mask` 移除死子，避免终局死子污染标签：
-#   1) 孤子（子数 <= 5 且斜对角无同色接应）：紧邻敌块中只要有气数 >= 3 的 → 判死清除；
-#      紧邻敌块气全 < 3 → 保留（双活）。
-#   2) 其它棋块：独立气数 <= 1 的残子清除。
-# 第 1 条迭代到不动点：清掉斜对角的接应子之后，本不孤立的子会变成孤子。
-PRUNE_DEAD_LUMPS = _env_int('GO_PRUNE_LUMP', 1)
+
 
 # ---------------- 自对弈（训练） ----------------
 # 每步 MCTS 模拟数，训练与评估共用（分开调会让两者强度不可比）。
@@ -137,17 +111,12 @@ NUM_SIMULATIONS = _env_int('GO_SIMS', 360)   # [可覆盖 GO_SIMS] 每步 MCTS �
 # 统一 KataGo 风格：Q 是“胜率 + 目差”的 utility，先在混合时压进 [-1,1]（见 mcts._utility），
 # 因此 Q 的刻度是绝对的，c_puct 可以跨局面通用。探索项再随父访问数对数增长、
 # 随子节点效用的标准差缩放（波动局面多探、平稳局面少探）。
-C_PUCT = _env_float('GO_CPUCT', 0.7)   # MCTS 探索常数基准
+C_PUCT = _env_float('GO_CPUCT', 1.0)   # MCTS 探索常数基准
 # 默认值取自 KataGo 的 gtp_example.cfg（cpuct 三行等价于
 # cpuctExploration / cpuctExplorationLog / cpuctUtilityStdevPrior+Scale）。
-CPUCT_LOG = _env_float('GO_CPUCT_LOG', 0.5)        # c_puct 随 log(父访问数) 增长的比例
+CPUCT_LOG = _env_float('GO_CPUCT_LOG', 0.6)        # c_puct 随 log(父访问数) 增长的比例
 CPUCT_BASE = _env_float('GO_CPUCT_BASE', 1000.0)     # 上述 log 增长的基准访问数
-# 目差压进 [-1,1] 的 tanh 尺度。**按可落子面积缩放，不能写死一个常数**：
-# 目差是「面积个独立点」之和，标准差 ∝ √面积；固定 30 会让同一个 α 在 9 路变成
-# 「看目差」（实测 mean|tanh(m/30)|=0.24、饱和率 0.5%）、在 19 路变成「看胜负」
-# （0.50 / 7.7%）。取 1.6·√面积后四档饱和度拉平到 5-10%。
-# 1.6 这个系数让 19 路落在 30.4（≈ 历史常量 30，保持既有对局行为）。
-UTIL_SCORE_PER_LINE = _env_float('GO_UTIL_SCORE_PER_LINE', 1.6)
+UTIL_SCORE_PER_LINE = _env_float('GO_UTIL_SCORE_PER_LINE', 2)
 
 
 def util_score_scale(area):
@@ -156,12 +125,8 @@ def util_score_scale(area):
 
 
 def is_half_step_komi(komi, eps=1e-9):
-    """贴目必须是 0.5 的整数倍（整数贴目也允许）。
-
-    原先是「必须 x.5」，理由是目差要落进分数头的半整数箱（分数头已删除）。
-    整数贴目不再有害；留下的唯一约束是 0.5 的粒度 —— 终局目差 = 整数 - 贴目，
-    贴目带 0.5 才能避免「和棋判定依赖浮点误差」这类问题（0.5 粒度下，整数贴目
-    会让平局成为真实可能出现的结果，winner=0 会当作「无标签/价值 0」处理）。
+    """
+    贴目必须是 0.5 的整数倍
     """
     v = float(komi)
     twice = v * 2.0
@@ -176,26 +141,14 @@ def validate_komi(komi):
     if not -100.0 <= v <= 100.0:
         raise ValueError('贴目超出合理范围: %r' % (komi,))
     return v
-# 基准原样搬 KataGo cfg 是 0.40，但实测我们的根节点 σ 中位只有 0.02~0.07 量级 ——
-# 用 0.40 时乘数恒 < 1，等于把探索常数静默砍到约两成，「波动加成」退化成常数压制。
-# 现按实测中位重标；σ 只在**已访问**的子招法上统计（未访问子是同值填补，混进去会把它稀释到 0）。
-# 量法与全部读数见 tools/srv/probe_cpuct_sigma.py 与当日日志。
+
 UTIL_STDEV_PRIOR = _env_float('GO_UTIL_STDEV_PRIOR', 0.1)  # 效用标准差基准（等于它时不缩放；已访问子不足 2 个时 σ 亦取它）
-UTIL_STDEV_SCALE = _env_float('GO_UTIL_STDEV_SCALE', 0.80)  # 波动加成的强度（0=关掉该加成）
-# 未访问子节点的**首访惩罚**（KataGo 的 fpuReductionMax）。本实现给未访问点填的是父节点
-# 均值 pv，等于假设"没试过的点与平均水平一样好"；而探索项 c·P·√N/(1+n) 恰好在未访问点
-# 最强（分母 1+n 最小）。两者叠加后，先验只要过千分之几的点都能拿到一次"礼貌性首访"，
-# 访问顺序完全由先验排列、不含任何搜索证据。KataGo 填的是 pv − fpu（根节点另有更小的
-# rootFpuReductionMax），给首访设了一道门槛。
-# 设 0 = 恢复原行为。⚠️ 改它等于换数据生成策略，与旧缓冲不同源。
+UTIL_STDEV_SCALE = _env_float('GO_UTIL_STDEV_SCALE', 0.8)  # 波动加成的强度（0=关掉该加成）
+
 FPU_REDUCTION = _env_float('GO_FPU', 0.02)   # [可覆盖 GO_FPU] 未访问点的首访惩罚
-# PASS 终局的失败方价值（按最后一手 PASS 的人结算）。比 -1 略高，让劣势方在
-# “停一手输”与“继续填子也输”之间选择停一手；获胜方仍为 +1.0。
-# 只影响 MCTS 搜索值，不改训练标签。
-PASS_TERMINAL_LOSS = _env_float('GO_PASS_LOSS', -0.94)
-# 前 zero_after 手按访问计数比例采样（τ=1，即 AlphaZero 标准），之后转贪心。
-# 窗口内不做衰减：τ<1 是在"搜索标签本身已经变尖"之上再锐化一遍，等于对同一件事罚两次。
-# 手数长的棋盘可以晚点转贪心；9 路对局本来就短，若沿用 80 手会几乎整局都在 τ=1 采样。
+
+RESIGN_THRESHOLD = _env_float('GO_RESIGN', 0.10)
+
 TEMPERATURE = 0.6                  # 训练开局温度（train_gui 滑块默认值）
 TEMPERATURE_ZERO_PER_POINT = 0.2  # 第 N 手（含）起转贪心，N 同样按可落子面积缩放
 
@@ -205,12 +158,10 @@ def board_temperature_zero_for_area(area):
 
 TOP_P = 0.95                       # 累计概率截断，落子采样与训练目标共用一套规则（支撑集若不一致，
                                    # 网络就会去拟合一批对局时从未被考虑过的着法）
-# 探索模式开局 = 让子：13 路以上黑先在 1~4 个角星位摆子，白先走、贴 0 目（原「四角各一子」已废弃），
-# 黑棋随机同侧或对角）。用途是自对弈的**开局多样性**——根噪声扰动的是"每一手怎么选"，
-# 管不住整局布局，开局一固定几百局就会反复走同一个布局，新增数据的边际信息量趋近于零。
-# 代价：这 4 手是强制落子、不过 MCTS，因此不进训练样本。
-# 本机默认开启；训练界面可单独勾选。只影响新生成的自对弈对局，不影响已有数据。
-EXPLORATION_MODE = True
+
+PCR_ENABLED = _env_int('GO_PCR', 0) > 0           # [可覆盖 GO_PCR] 1=默认开启
+PCR_PROB = _env_float('GO_PCR_PROB', 0.25)        # [可覆盖 GO_PCR_PROB] 全搜索局面比例
+PCR_FAST_DIV = _env_int('GO_PCR_FAST_DIV', 6)     # [可覆盖 GO_PCR_FAST_DIV] 快搜索访问数除数
 
 # ---------------- MCTS 搜索 ----------------
 DIRICHLET_ALPHA = _env_float('GO_DIR_ALPHA', 0.03)   # [可覆盖 GO_DIR_ALPHA] 根节点 Dirichlet 噪声浓度
@@ -227,7 +178,7 @@ MCTS_CAP = _env_int('GO_MCTS_CAP', 600000)       # [可覆盖 GO_MCTS_CAP] 搜�
 # ---------------- 神经网络 ----------------
 # 空间通道只放“逐点不同”的平面；全局标量/向量单独走 global_features，
 # 不再用整张常数平面去挤占空间通道。新增空间通道仍只能追加在末尾。
-INPUT_CHANNELS = 11                # 空间输入通道数
+INPUT_CHANNELS = 18                # 空间输入通道数
 CH_OWN_STONES = 0                  # 己方棋子
 CH_OPP_STONES = 1                  # 对方棋子
 CH_LAST_MOVE = 2                   # 上一手位置（无上一手则全 0）
@@ -241,13 +192,20 @@ CH_BOUNDARY = 6                    # 棋盘边界：洞 -1、可落子 0、内�
                                    # ⚠️ 改这个值 = 换了输入编码，旧 data/ 里的样本全部作废（张量已存盘，事后补不出来）
 CH_OWN_LADDER = 7                  # 己方「只剩 1 气」棋块：按己方先走，+1 可逃到 >=3 气，-1 被提，0 不确定/不在打吃
 CH_OPP_LADDER = 8                  # 对方「只剩 1 气」棋块：按对方先走，+1 可逃，-1 被提，0 不确定/不在打吃
-# 9/10 是 Benson 无条件活（pass-alive）棋子掩码：属于「最大无条件活集合」的己方/对方棋子。
-# 不是启发式眼位，而是形式化判定（Benson 1976：与「对手全 pass 也杀不掉」等价）。
-# 只在可落子点上是 0/1；洞恒 0（洞的 −1 语义只属于边界通道）。
-CH_OWN_ALIVE = 9
-CH_OPP_ALIVE = 10
+# 空点按「包围它的棋色」分成三块（只标空点，棋子/洞全 0）：
+CH_OWN_REGION = 9                  # 只挨己方棋子的空区域（己方地盘）
+CH_OPP_REGION = 10                 # 只挨对方棋子的空区域
+CH_NEUTRAL_REGION = 11             # 其余空区域：双方都挨（单官）或都不挨（开局空盘）
+# 链级特征（同色连通块 = 一条链）。注意方向不同：
+#   链子数是正向（子越多值越大）；眼个数/眼面积是**危险度**（和危急度同向，值越大越危险）。
+CH_OWN_CHAIN_SIZE = 12             # 己方链子数 / 20（1 子=0.05，>=20 子=1.0，正向）
+CH_OPP_CHAIN_SIZE = 13             # 对方链子数 / 20
+CH_OWN_EYE_CNT = 14                # 己方链挨着的「单色封闭区域」个数：0 个=1.0，1 个=0.5，>=2 个=0（危险度）
+CH_OPP_EYE_CNT = 15                # 同上，对方链
+CH_OWN_EYE_AREA = 16               # 己方链挨着的单色区域总面积：0=1.0，1=0.9，线性，>=10=0（危险度）
+CH_OPP_EYE_AREA = 17               # 同上，对方链
 
-# 全局特征：当前 5 维；模型只依赖 GLOBAL_DIM，编码侧与模型输入端都读这里的顺序。
+# 全局特征：当前 6 维；模型只依赖 GLOBAL_DIM，编码侧与模型输入端都读这里的顺序。
 # 数量类特征统一用 2*count/可落子面积 - 1 归一到 [-1, 1]：
 #   0 子 → -1，半盘 → 0，满盘 → +1。
 GLOBAL_DIM = 6
@@ -262,21 +220,15 @@ KOMI_SCALE = 14.0
 CHANNELS = 128                     # 主干通道数
 HEAD_CHANNELS = 64                 # 头部通道数
 NUM_RES_BLOCKS = 10                # pre-activation 残差块数
-INPUT_KERNEL = 5                   # 输入 stem 卷积核（KataGo: 5x5）
+INPUT_KERNEL = 3                   # 输入 stem 卷积核
 GPOOL_BLOCKS = (3, 6, 10)          # 1-based 的 gpool 位置；只在少数块做全局池化
-DROPOUT_RATE = 0.01                # 残差块 dropout（推理无成本）
-# 主干保持纯卷积。曾试过在末端挂自注意力块，想补"远端两点直接连线"这类路径判断
-# （卷积要靠层层叠加传远，传过去时位置精度已被反复加权揉碎）。四轮对照下来，
-# 块的权重位移与损失都和基线没有区别，判定它不解决当前的瓶颈，故移除。
-# 完整数据见 AGENT.md 的"注意力块"一节。
+DROPOUT_RATE = 0                # 残差块 dropout（推理无成本）
+# 主干是纯卷积（10 个 PreActResBlock）。
 
 # ---------------- 训练 ----------------
-BATCH_SIZE = _env_int('GO_BATCH', 64)  # [可覆盖 GO_BATCH] 训练批大小（按显存调；4GB 卡实测 64 峰值约 1.7GB）
+BATCH_SIZE = _env_int('GO_BATCH', 128)  # [可覆盖 GO_BATCH] 训练批大小（按显存调；4GB 卡实测 64 峰值约 1.7GB）
 GRAD_ACCUM_STEPS = 2                # 梯度累积：每 N 个 micro-batch 才 step 一次（等效 batch = N×BATCH_SIZE），1=关闭
 LEARNING_RATE = _env_float('GO_LR', 0.0002)  # [可覆盖 GO_LR] 学习率（GUI 当前默认，训练入口以此为准）
-# gpool（每个残差块里的全局池化偏置）单独学习率。和「新通道」同一套做法：**放大梯度**而不是
-# param_groups —— 两者共用同一条更新路径，才不会出现「两套机制并存、不知哪条在起作用」。
-GPOOL_LR = _env_float('GO_GPOOL_LR', 0.0)     # [可覆盖 GO_GPOOL_LR] gpool 单独学习率，0=关
 # 全局特征（棋子数 / 提子数）单独学习率。这四列是从 0 附近起步的新参数，
 # 和已经训了很久的贴目列抢同一份梯度是吃亏的，所以单独放大。
 GLOBAL_LR = _env_float('GO_GLOBAL_LR', 1e-3)  # [可覆盖 GO_GLOBAL_LR] 全局特征列的学习率，0=关
@@ -285,13 +237,18 @@ WEIGHT_DECAY = 0.0001              # 权重衰减
 MOMENTUM = 0.90                    # SGD 动量（GUI 当前默认）
 OPTIMIZER_NAME = 'SGD'             # Adam / SGD（GUI 当前默认）
 WARMUP_STEPS = 20                  # 学习率 warmup 步数（前 N 步线性升至目标 lr）
+# 训练时随机清空「上一手」通道（CH_LAST_MOVE）的样本比例。
+# 0.5 = 一半样本看不到对手刚下在哪，逼模型自己从棋子分布判断要点，
+# 而不是顺着对手节奏应招（自对弈数据里这个提示太强，模型会依赖它）。
+# 与 D4 增强独立叠加；推理/MCTS 侧照常喂真实上一手，两种输入都要能应对。
+AUG_LAST_MOVE_DROP = _env_float('GO_LAST_MOVE_DROP', 0.5)  # [可覆盖 GO_LAST_MOVE_DROP] 0 = 关闭
 # ---------------- 权重滑动平均（EMA） ----------------
 # 自对弈和保存都用 EMA 权重，原始权重只用于训练。
 # 为什么：自对弈拿"刚更新完的原始权重"产数据，等于把这一步的噪声原样喂回搜索；
 # 保存时也一样，存下来的是一帧抖动值。EMA 是标准做法（AlphaZero / KataGo 都是）。
 # 足够压掉单步噪声，又不会让 EMA 落后于正在改进的模型。
 EMA_ENABLED = _env_int('GO_EMA', 1)             # [可覆盖 GO_EMA] 0 = 关闭（EMA 恒等于原始权重）
-EMA_DECAY = _env_float('GO_EMA_DECAY', 0.995)     # [可覆盖 GO_EMA_DECAY] 常数衰减系数
+EMA_DECAY = _env_float('GO_EMA_DECAY', 0.99)     # [可覆盖 GO_EMA_DECAY] 常数衰减系数
 # 策略输出熵约束：H(q) 超过 ENTROPY_TARGET 才罚，罚项 = w·(H(q)−target)²。
 # 用 hinge 而非线性项（−w·H(q)），是因为线性项对「已经够尖」的输出照样给梯度，
 # 会一路压下去；hinge 只在过散时推一把，把目标值定在阈值上而不是"越尖越好"。
@@ -300,18 +257,20 @@ ENTROPY_TARGET = _env_float('GO_ENT_TARGET', 2.0)      # [可覆盖 GO_ENT_TARGE
 #    与关闭正好相反。权重为 0 时罚项恒为 0、不产生梯度，阈值留着不用即可。
 ENTROPY_HINGE_WEIGHT = _env_float('GO_ENT_W', 0.0)     # [可覆盖 GO_ENT_W] 熵约束权重（0 = 关闭该项）
 OWN_WEIGHT = 1.5                   # 领地头损失权重
+# 宏观领地项权重：((Σtanh(own) − 实际终局目差)/有效面积)^2 直接并入平均领地损失。
+OWN_MACRO_WEIGHT = _env_float('GO_OWN_MACRO', 0.0)
 WIN_WEIGHT = 0.5                   # 胜率头损失权重（tanh(win_logit) → 当前玩家胜负 ±1）
-                                   # 实测 1.5 时共享主干梯度约 3/4 来自 win，0.5 更平衡
 
-ALPHA = 0.00                      # MCTS价值线性混合因子：value = (1-α)·胜率logit + α·(归属头目差+贴目)；0=纯胜率，1=纯目差
+ALPHA = _env_float('GO_ALPHA', 0.0)   # [可覆盖 GO_ALPHA] MCTS 价值线性混合因子：
+                                      # value = (1-α)·胜率logit + α·(归属头目差+贴目)；0=纯胜率，1=纯目差
 GRAD_CLIP_NORM = 5.0               # 梯度裁剪范数
-SAVE_INTERVAL = 10                 # 保存模型间隔（局数，自对弈模式）
+SAVE_INTERVAL = 20                 # 保存模型间隔（局数，自对弈模式）
 UI_UPDATE_BATCHES = 10             # 仅训练模式：每 N 个 Batch 更新一次界面（显示 N 个 Batch 损失均值）
 SAVE_INTERVAL_BATCHES = 100        # 仅训练模式：每 N 个 Batch 保存一次模型
 TRAIN_GAMES = 10000                 # GUI 默认训练局数（自对弈模式）
 TRAIN_STEPS_PER_GAME = 16          # 自对弈模式每局训练步数（= 每局反向传播次数）；除 GRAD_ACCUM_STEPS
                                    # 后才是每局 optimizer.step 次数 —— 调训练量看的是这个商
-TRAINING_DATA_MAX = _env_int('GO_DATA_MAX', 100000)  # [可覆盖 GO_DATA_MAX] 训练数据缓冲上限
+TRAINING_DATA_MAX = _env_int('GO_DATA_MAX', 150000)  # [可覆盖 GO_DATA_MAX] 训练数据缓冲上限
                                     # 紧凑样本约 2KB/条；200k 约 400MB 内存
 
 
@@ -321,10 +280,10 @@ DATA_DIR = 'data/'                 # 每局一个紧凑 .npz
 
 # ---------------- GUI（人对弈 gui.py） ----------------
 # 模拟数与探索常数直接复用上面的 NUM_SIMULATIONS / C_PUCT。
-GUI_MAX_SIMS = 5000                # GUI 最多支持模拟数（用于计算搜索树容量）
+GUI_MAX_SIMS = 10000                # GUI 最多支持模拟数（用于计算搜索树容量）
 GUI_TEMPERATURE = 0.0              # GUI 落子温度（人对弈，固定贪心）
-GUI_SIMS_PER_TICK = 8             # GUI 每次 UI 步进最多跑多少模拟（界面刷新粒度）
-GUI_STEP_MS = 15                   # GUI 搜索步进间隔（ms）
+GUI_SIMS_PER_TICK = 16             # GUI 每次 UI 步进最多跑多少模拟（界面刷新粒度）
+GUI_STEP_MS = 10                   # GUI 搜索步进间隔（ms）
 GUI_DEBUG = True                   # GUI 调试输出开关
 GUI_CRASH_LOG = os.path.join(LOG_DIR, 'gui_crash.log')        # GUI 异常日志（诊断闪退用）
 GUI_CRASH_NATIVE_LOG = os.path.join(LOG_DIR, 'gui_crash_native.log')
@@ -343,3 +302,4 @@ def temperature_schedule(temperature, move_count, zero_after):
     if zero_after is not None and move_count >= zero_after:
         return 0.0
     return temperature
+

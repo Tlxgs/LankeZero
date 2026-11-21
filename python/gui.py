@@ -1,4 +1,5 @@
 import os
+import threading
 import traceback
 import time
 import faulthandler
@@ -27,13 +28,85 @@ try:
     faulthandler.enable(open(GUI_CRASH_NATIVE_LOG, 'a', buffering=1))
 except Exception:
     pass
+_GUI_CAP_LIMIT = 6_000_000   # 大棋盘的树容量上限（100 路时 5000×面积×1.2 会到 6000 万）
+
+
 def _gui_cap(board_size):
-    return max(MCTS_CAP, int(GUI_MAX_SIMS * board_size * board_size * 1.2))
+    want = int(GUI_MAX_SIMS * board_size * board_size * 1.2)
+    return max(MCTS_CAP, min(want, _GUI_CAP_LIMIT))
+
+
+_BOARD_MARGIN = 60
+# 19 路的画布尺寸：18 格 × 60px + 两侧 60px 边距 = 1200px。其它尺寸按它反推格距。
+_BOARD_CANVAS = (19 - 1) * 60 + 2 * _BOARD_MARGIN
 
 
 def _board_cell(board_size):
-    """大棋盘缩小格距，避免 21/23 路窗口超出屏幕。"""
-    return 60 if int(board_size) <= 19 else 48
+    """所有棋盘都画成和 19 路一样大（画布约 1200px）。
+
+    19 路当前是 60px 格距 + 60px 边距 = 1200px；小棋盘按同一画布反推格距
+    （9 路 135px、13 路 90px），否则 9 路只有 600px 窗口，看着很小。
+    """
+    n = int(board_size)
+    return max(8, (_BOARD_CANVAS - 2 * _BOARD_MARGIN) // max(1, n - 1))
+
+
+# 右侧小棋盘：画布固定 420px，任何路数都缩放到这个大小。
+_MINI_CANVAS = 420
+_MINI_MARGIN = 14
+# 搜索中每 N 拍重画一次「MCTS统计」小棋盘；静态内容（棋子/领地/先验）只在
+# 落子、悔棋、换模式时重画，避免把搜索拖慢。
+_MINI_DRAW_EVERY = 5
+
+
+class _BoardView:
+    """一块棋盘的绘制目标：画布 + GameBoard + 格距/边距 + 路数。
+
+    主棋盘和小棋盘共用同一套绘制函数，区别只有画布尺寸和 show_text
+    （小棋盘格距小，MCTS/先验只上色、不写数字）。
+    """
+
+    __slots__ = ("canvas", "board", "cell", "margin", "n", "show_text")
+
+    def __init__(self, canvas, board, cell, margin, n, show_text=True):
+        self.canvas = canvas
+        self.board = board
+        self.cell = cell
+        self.margin = margin
+        self.n = int(n)
+        self.show_text = bool(show_text)
+
+
+class _MiniBoard:
+    """右侧上下摆放的小棋盘：固定画布尺寸，网格按路数缩放并居中。"""
+
+    def __init__(self, parent, board_size, hole_mask, title):
+        self.frame = ttk.Frame(parent)
+        # 画布在上、标题在下：小棋盘1 的画布上边缘因此能和主棋盘对齐（标题不占上方空间）。
+        self.canvas = tk.Canvas(self.frame, width=_MINI_CANVAS, height=_MINI_CANVAS,
+                                bg="#D1D1D1", highlightthickness=0)
+        self.canvas.pack(side=tk.TOP)
+        self.label = ttk.Label(self.frame, text=title, foreground="#444444")
+        self.label.pack(anchor="w")
+        self.view = None
+        self.set_game(board_size, hole_mask)
+
+    def set_game(self, board_size, hole_mask):
+        n = int(board_size)
+        cell = max(6, (_MINI_CANVAS - 2 * _MINI_MARGIN) // max(1, n - 1))
+        margin = (_MINI_CANVAS - (n - 1) * cell) // 2
+        board = GameBoard(self.canvas, n, cell, margin, hole_mask=hole_mask)
+        self.view = _BoardView(self.canvas, board, cell, margin, n, show_text=False)
+        self.canvas.delete("all")
+
+    def set_visible(self, visible):
+        if visible:
+            self.frame.pack(side=tk.TOP, pady=(0, 8))
+        else:
+            self.frame.pack_forget()
+
+    def set_title(self, text):
+        self.label.config(text=text)
 
 
 class GameGUI:
@@ -71,7 +144,7 @@ class GameGUI:
         except Exception as e:
             msg = (f"模型初始化失败，GUI 无法启动：\n{type(e).__name__}: {e}\n\n"
                    "请检查：\n"
-                   "1) 权重是否存在，且是当前 KataGo-lite 架构（空间 11 通道 + 全局 1 维）\n"
+                   "1) 权重是否存在，且是当前 KataGo-lite 架构（空间 9 通道 + 全局 6 维）\n"
                    f"   当前路径: {self.model_path}\n"
                    "2) PyTorch CUDA 是否可用（也可用 --device cpu）\n"
                    "3) 显存是否被其他进程占用")
@@ -81,7 +154,7 @@ class GameGUI:
                 print(msg)
             raise SystemExit(1)
 
-        self.cell_size, self.margin = _board_cell(self.board_size), 60
+        self.cell_size, self.margin = _board_cell(self.board_size), _BOARD_MARGIN
         self.canvas_size = (self.board_size - 1) * self.cell_size + 2 * self.margin
 
         self.root = tk.Tk()
@@ -109,6 +182,10 @@ class GameGUI:
         self.dir_eps_var = tk.DoubleVar(value=self.mcts.dirichlet_epsilon)
         self.dir_alpha_var = tk.DoubleVar(value=self.mcts.dirichlet_alpha)
         self.mode_var = tk.StringVar(value="对弈棋盘")
+        self.mini1_var = tk.StringVar(
+            value="领地归属" if self.ui.show_ownership else "对弈棋盘")
+        self.mini2_var = tk.StringVar(value="策略网络概率")
+        self.mini_modes = ["不显示"] + self._display_modes()
         self.black_auto_var = tk.BooleanVar(value=False)   # 黑棋自动落子：搜索完成后自动落子
         self.white_auto_var = tk.BooleanVar(value=False)   # 白棋自动落子
 
@@ -135,6 +212,15 @@ class GameGUI:
             ttk.Spinbox(ctrl, from_=-21, to=21.0, increment=0.5,
                         textvariable=self.komi_var, width=8).grid(row=row, column=1, pady=3)
             row += 1
+            # 黑棋激进度：只加在「喂给网络的贴目」上。模型看到的是 komi+bias，
+            # 黑白视角取反后仍互为相反数；真实规则/结算/双 pass 胜负都不受影响。
+            # 正值 = 黑棋以为自己更吃亏 → 下得更凶，白棋更保守。
+            ttk.Label(ctrl, text="黑棋激进度:").grid(row=row, column=0, sticky="w", pady=3)
+            self.komi_bias_var = tk.DoubleVar(value=0.0)
+            ttk.Spinbox(ctrl, from_=-30.0, to=30.0, increment=0.5,
+                        textvariable=self.komi_bias_var, width=8).grid(
+                            row=row, column=1, pady=3)
+            row += 1
 
         ttk.Label(ctrl, text="棋盘:").grid(row=row, column=0, sticky="w", pady=3)
         self.board_size_var = tk.IntVar(value=self.board_size)
@@ -151,16 +237,31 @@ class GameGUI:
             row += 1
             ttk.Button(ctrl, text="编辑形状", command=self._on_shape_change).grid(
                 row=row, column=0, columnspan=2, sticky="ew", pady=2)
+            row += 1
+            ttk.Button(ctrl, text="编辑死活题", command=self._on_ld_editor).grid(
+                row=row, column=0, columnspan=2, sticky="ew", pady=2)
 
         row += 1
-        ttk.Label(ctrl, text="显示:").grid(row=row, column=0, sticky="w", pady=3)
-        modes = ["对弈棋盘", "MCTS统计", "策略网络概率"]
-        if self.ui.show_ownership:
-            modes.append("领地归属")
+        ttk.Label(ctrl, text="主棋盘:").grid(row=row, column=0, sticky="w", pady=3)
+        modes = self._display_modes()
         mode_cb = ttk.Combobox(ctrl, textvariable=self.mode_var,
                                values=modes, state="readonly", width=12)
         mode_cb.grid(row=row, column=1, pady=3)
         mode_cb.bind("<<ComboboxSelected>>", lambda _: self._draw())
+
+        row += 1
+        ttk.Label(ctrl, text="小棋盘1:").grid(row=row, column=0, sticky="w", pady=3)
+        mini1_cb = ttk.Combobox(ctrl, textvariable=self.mini1_var,
+                                values=self.mini_modes, state="readonly", width=12)
+        mini1_cb.grid(row=row, column=1, pady=3)
+        mini1_cb.bind("<<ComboboxSelected>>", lambda _: self._on_mini_mode_change())
+
+        row += 1
+        ttk.Label(ctrl, text="小棋盘2:").grid(row=row, column=0, sticky="w", pady=3)
+        mini2_cb = ttk.Combobox(ctrl, textvariable=self.mini2_var,
+                                values=self.mini_modes, state="readonly", width=12)
+        mini2_cb.grid(row=row, column=1, pady=3)
+        mini2_cb.bind("<<ComboboxSelected>>", lambda _: self._on_mini_mode_change())
 
         row += 1
         auto_frame = ttk.Frame(ctrl)
@@ -179,15 +280,15 @@ class GameGUI:
         ttk.Button(ctrl, text="应用参数", command=self._apply_params) \
             .grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
         row += 1
+        ttk.Button(ctrl, text="刷新模型", command=self._on_reload_model) \
+            .grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
         ttk.Button(ctrl, text="重置游戏", command=self._reset) \
             .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
         if self.ui.show_pass:
             row += 1
             ttk.Button(ctrl, text="弃权 (Pass)", command=self._human_pass) \
                 .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
-        row += 1
-        ttk.Button(ctrl, text="退出", command=self.root.quit) \
-            .grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
 
         # 胜率条
         row += 1
@@ -231,13 +332,29 @@ class GameGUI:
                                       font=('微软雅黑', 12))
         self.winhead_label.pack()
 
-        # 棋盘
-        self.canvas = tk.Canvas(self.root, width=self.canvas_size, height=self.canvas_size,
+        # 棋盘 + 右侧小棋盘放进同一个容器：容器高度=主棋盘高度，在窗口里垂直居中
+        # （主棋盘位置与以前一致）；小棋盘1 在容器内顶部对齐 ⇒ 上边缘与主棋盘同一条水平线。
+        self.board_area = ttk.Frame(self.root)
+        self.board_area.grid(row=0, column=1, padx=5, pady=10)
+        self.canvas = tk.Canvas(self.board_area, width=self.canvas_size, height=self.canvas_size,
                                 bg="#D1D1D1", highlightthickness=0)
-        self.canvas.grid(row=0, column=1, padx=5, pady=10)
+        self.canvas.pack(side=tk.LEFT)
         self.board = GameBoard(self.canvas, self.board_size, self.cell_size,
                                self.margin, hole_mask=self.hole_mask)
         self.canvas.bind("<Button-1>", self._on_click)
+        self.main_view = _BoardView(self.canvas, self.board, self.cell_size,
+                                    self.margin, self.board_size, show_text=True)
+
+        # 右侧：两个固定大小的小棋盘（上下摆放）。都选「不显示」时窗口与原来一样。
+        self.mini_frame = ttk.Frame(self.board_area)
+        self.mini_frame.pack(side=tk.LEFT, anchor="n", padx=(8, 0))
+        self.mini1 = _MiniBoard(self.mini_frame, self.board_size, self.hole_mask,
+                                "小棋盘1 · " + self.mini1_var.get())
+        self.mini2 = _MiniBoard(self.mini_frame, self.board_size, self.hole_mask,
+                                "小棋盘2 · " + self.mini2_var.get())
+        self.mini1.set_visible(self.mini1_var.get() != "不显示")
+        self.mini2.set_visible(self.mini2_var.get() != "不显示")
+        self._mini_tick = 0
 
         # 搜索状态（单线程，无锁）
         self._search_gen = 0
@@ -259,6 +376,35 @@ class GameGUI:
         self.root.report_callback_exception = self._log_exception
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # 先把空棋盘画出来（窗口立刻可见）；征子求解器的 numba JIT（cache=False，
+        # 每个进程约 10 秒）放到后台线程编译，编译完再建根、估值、开始搜索。
+        self._precompiled = False
+        try:
+            self._draw()
+        except Exception as e:
+            self._log_exception(type(e), e, e.__traceback__)
+        threading.Thread(target=self._precompile_worker, daemon=True).start()
+        self.root.after(50, self._after_precompile)
+        self.root.mainloop()
+
+    def _precompile_worker(self):
+        """后台线程：只调纯函数触发 JIT，不碰搜索树，避免和主线程抢状态。
+
+        先把 game 抓成局部变量：换棋盘时主线程会替换 self.game，
+        两次读 self.game 可能一次拿到旧盘、一次拿到新盘（合法掩码尺寸对不上）。
+        """
+        try:
+            g = self.game
+            legal = g.get_legal_mask()
+            g.get_canonical_state(legal_mask=legal)
+        except Exception as e:
+            self._log_exception(type(e), e, e.__traceback__)
+        self._precompiled = True
+
+    def _after_precompile(self):
+        if not getattr(self, "_precompiled", True):
+            self.root.after(50, self._after_precompile)
+            return
         try:
             self._init_mcts()
             self._update_score_diff()
@@ -268,7 +414,6 @@ class GameGUI:
         except Exception as e:
             self._log_exception(type(e), e, e.__traceback__)
             print(f"[GUI] 初始化阶段异常（已忽略，继续运行）: {type(e).__name__}: {e}")
-        self.root.mainloop()
 
     # ---------------- 初始化 / 判断 ----------------
 
@@ -352,19 +497,28 @@ class GameGUI:
 
     # ---------------- 绘制 ----------------
 
-    def _draw(self):
+    def _display_modes(self):
+        modes = ["对弈棋盘", "MCTS统计", "策略网络概率"]
+        if self.ui.show_ownership:
+            modes.append("领地归属")
+        return modes
+
+    def _on_mini_mode_change(self):
+        # 先全部摘掉再按 1→2 重新 pack，否则单独恢复某一个小棋盘时会排到下面去。
+        for mini in (self.mini1, self.mini2):
+            mini.frame.pack_forget()
+        for idx, (mini, var) in enumerate(((self.mini1, self.mini1_var),
+                                           (self.mini2, self.mini2_var)), 1):
+            mode = var.get()
+            mini.set_title("小棋盘%d · %s" % (idx, mode))
+            if mode != "不显示":
+                mini.set_visible(True)
+        self._draw()
+
+    def _draw(self, force_mini=True):
         root = self.mcts.root
         children = root.children if root else {}
-        self.canvas.delete("all")
-        self.board.draw_grid()
-        self.board.draw_stars()
-        mode = self.mode_var.get()
-        if mode == "对弈棋盘":
-            self._draw_pieces()
-        elif mode == "领地归属":
-            self._draw_ownership()
-        else:
-            self._draw_stats(mode == "策略网络概率", children)
+        self._paint(self.main_view, self.mode_var.get(), children)
         self._draw_pass_info(children)
         self._draw_winrate()
         bw = self.black_weighted if hasattr(self, 'black_weighted') else 0
@@ -381,56 +535,93 @@ class GameGUI:
         else:
             black_p = p_cur if self.game.current_player == 1 else 1.0 - p_cur
             self.winhead_label.config(text=f"黑棋胜率: {black_p*100:.1f}%")
+        self._draw_minis(children, force_mini)
 
-    def _draw_ownership(self):
+    def _paint(self, view, mode, children):
+        """按模式把一块棋盘（主棋盘或小棋盘）画满。"""
+        view.canvas.delete("all")
+        view.board.draw_grid()
+        view.board.draw_stars()
+        if mode == "对弈棋盘":
+            self._draw_pieces(view)
+        elif mode == "领地归属":
+            self._draw_ownership(view)
+        elif mode == "策略网络概率":
+            self._draw_stats(True, children, view)
+        else:
+            self._draw_stats(False, children, view)
+
+    def _draw_minis(self, children, force):
+        """小棋盘重画策略：静态内容只在 force 时画；搜索中只让「MCTS统计」跟着刷新。"""
+        self._mini_tick += 1
+        for mini, var in ((self.mini1, self.mini1_var), (self.mini2, self.mini2_var)):
+            mode = var.get()
+            if mini is None or mode == "不显示":
+                continue
+            if not (force or (mode == "MCTS统计"
+                              and self._mini_tick % _MINI_DRAW_EVERY == 0)):
+                continue
+            self._paint(mini.view, mode, children)
+
+    def _draw_ownership(self, view=None):
         """可视化领地归属：黑白灰小正方形叠加在棋子上方"""
+        view = view or self.main_view
         own = self.current_ownership
         if own is None:
             return
 
         # 1. 先绘制当前棋盘上的棋子（活子/死子保持原样）
-        self._draw_pieces()
+        self._draw_pieces(view)
 
         # 2. 在每格中心画小正方形，颜色由 ownership 值映射为灰度
-        for r in range(self.board_size):
-            for c in range(self.board_size):
+        for r in range(view.n):
+            for c in range(view.n):
                 if self.game.is_hole(r, c):
                     continue
-                x = self.margin + c * self.cell_size
-                y = self.margin + r * self.cell_size
+                x = view.margin + c * view.cell
+                y = view.margin + r * view.cell
                 d = float(np.nan_to_num(own[r, c], nan=0.0))  # ∈[-1, 1]
                 # 将 d 映射到灰度 0(黑) ~ 255(白)
                 gray = int(128 - 127 * d)                # d=1 -> 0, d=0 -> 128, d=-1 -> 255
                 gray = max(0, min(255, gray))
                 color = f'#{gray:02x}{gray:02x}{gray:02x}'
                 # 正方形边长约为棋子直径的 60%
-                size = int(self.cell_size * 0.5)
-                self.canvas.create_rectangle(
+                size = max(2, int(view.cell * 0.5))
+                view.canvas.create_rectangle(
                     x - size//2, y - size//2,
                     x + size//2, y + size//2,
                     fill=color, outline='', width=0
                 )
 
 
-    def _draw_pieces(self):
-        for r in range(self.board_size):
-            for c in range(self.board_size):
+    def _draw_pieces(self, view=None):
+        view = view or self.main_view
+        for r in range(view.n):
+            for c in range(view.n):
                 if self.game.is_hole(r, c):
                     continue
                 p = self.game.board[r, c]
                 if p:
-                    self.board.draw_piece(r, c, p)
+                    view.board.draw_piece(r, c, p)
         if self.game.last_move and self.game.last_move != PASS_MOVE:
-            self.board.highlight_move(*self.game.last_move)
+            view.board.highlight_move(*self.game.last_move)
 
     @staticmethod
     def _mixed_to_node_winrate(v):
-        """MCTS utility（[-1,1] 的胜负式混合值）→ 该节点行棋方的胜率。"""
-        return (float(v) + 1.0) / 2.0
+        """MCTS utility → 该节点行棋方的胜率。
 
-    def _draw_stats(self, is_policy, children):
+        终局价值是纯胜负 ±1，叶子值是 (1-α)·tanh(胜率) + α·(目差/尺度)。
+        **目差项没有 tanh，所以 utility 无界**：领先很多时能超过 1（比如 2.3），
+        落后时低于 -1。这里必须裁到 [-1,1]，否则棋盘上会显示成 165% 或负百分比。
+        只影响显示，不影响搜索。
+        """
+        v = max(-1.0, min(1.0, float(v)))
+        return (v + 1.0) / 2.0
+
+    def _draw_stats(self, is_policy, children, view=None):
+        view = view or self.main_view
         # 棋子与对弈棋盘完全一致（黑白实心 + 最近落子红点）
-        self._draw_pieces()
+        self._draw_pieces(view)
         if not children:
             return
         stats = []
@@ -447,19 +638,26 @@ class GameGUI:
             stats.append((m, vis, wr, ch.prior_prob))
         if not stats:
             return
+        key = (lambda s: s[3]) if is_policy else (lambda s: s[1])
+        # 大棋盘（>50 路）上万个候选点，逐个画圆会把界面拖死：只画最重要的 120 个。
+        if view.n * view.n > 2500 and len(stats) > 120:
+            stats.sort(key=key, reverse=True)
+            stats = stats[:120]
         max_val = max(s[3] if is_policy else s[2] for s in stats)
-        best = max(stats, key=lambda s: s[3] if is_policy else s[1])[0]
+        best = max(stats, key=key)[0]
         for m, vis, wr, prob in stats:
             if is_policy:
                 # 概率按当前盘面最大值归一化后再上色，否则低先验全落在色带同一端
                 rel = prob / max_val if max_val > 0 else 0.0
-                self.board.draw_stat_circle(m[0], m[1], rel,
-                                            f"{prob*100:.1f}%")
+                view.board.draw_stat_circle(
+                    m[0], m[1], rel,
+                    f"{prob*100:.1f}%" if view.show_text else "")
             elif vis:
                 # 胜率本身就是 0..1，直接上色（不能再除以 max，否则 50% 会被画成满格）
-                self.board.draw_stat_circle(m[0], m[1], wr,
-                                            f"{wr*100:.1f}\n{vis}")
-        self.board.draw_best_circle(*best)
+                view.board.draw_stat_circle(
+                    m[0], m[1], wr,
+                    f"{wr*100:.1f}\n{vis}" if view.show_text else "")
+        view.board.draw_best_circle(*best)
 
     def _draw_pass_info(self, children):
         """在棋盘下方显示 Pass 的先验概率与搜索次数"""
@@ -697,7 +895,7 @@ class GameGUI:
                     print("[GUI] 搜索未能推进（搜索树为空），本手停止搜索")
                 return
             self._sim_count += done
-            self._draw()
+            self._draw(force_mini=False)
         except Exception as e:
             # 搜索异常不崩：记录日志并停止本轮搜索（避免每 10ms 重复刷屏）
             self._log_exception(type(e), e, e.__traceback__)
@@ -705,6 +903,20 @@ class GameGUI:
         self.root.after(STEP_MS, lambda: self._search_step(gen))
 
     # ---------------- 参数 / 重置 ----------------
+
+    def _komi_bias(self):
+        """当前「黑棋激进度」值（模型输入贴目偏移）；控件缺失/非法输入按 0 处理。
+
+        一个数同时决定两件事：黑棋以为贴目 b 目、白棋以为贴目 -b 目，
+        所以 +b = 黑棋激进 + 白棋保守，-b 反过来。
+        """
+        var = getattr(self, "komi_bias_var", None)
+        if var is None:
+            return 0.0
+        try:
+            return float(var.get())
+        except Exception:
+            return 0.0
 
     def _restart_board(self, size, hole_mask, shape_name, komi, stones=None):
         """按 (尺寸, 形状/开局, 贴目) 重建对局、推理器、搜索树，并重启搜索。
@@ -745,13 +957,19 @@ class GameGUI:
             size, hole_mask, shape_name, komi
         self.start_stones = stones
         self.game = game
+        game.model_komi_bias = self._komi_bias()
         self.evaluator = evaluator
         self.mcts = mcts
-        self.cell_size, self.margin = _board_cell(size), 60
+        self.cell_size, self.margin = _board_cell(size), _BOARD_MARGIN
         self.canvas_size = (size - 1) * self.cell_size + 2 * self.margin
         self.canvas.config(width=self.canvas_size, height=self.canvas_size)
         self.board = GameBoard(self.canvas, size, self.cell_size, self.margin,
                                hole_mask=hole_mask)
+        self.main_view = _BoardView(self.canvas, self.board, self.cell_size,
+                                    self.margin, size, show_text=True)
+        for mini in (getattr(self, "mini1", None), getattr(self, "mini2", None)):
+            if mini is not None:
+                mini.set_game(size, hole_mask)
         self.shape_label.config(text=shape_name)
         self.root.title(self._window_title())
         self._history.clear()
@@ -791,12 +1009,91 @@ class GameGUI:
         name = "整盘" if (not mask.any() and stones is None) else "自定义"
         self._restart_board(self.board_size, mask, name, self.komi, stones)
 
+    def _on_ld_editor(self, event=None):
+        """死活题编辑器（固定 13 路）：点确定后把该局面载入主棋盘。
+
+        题目按 komi=0 定义，所以载入时贴目也设成 0；棋子就是题目盘面，
+        载入后可以直接让 AI 搜这一手。取消（mask is None）则什么都不变。
+        """
+        try:
+            import shape_editor
+            mask, stones, bpt, wpt = shape_editor.edit_ld_problem(self.root, 13)
+        except Exception as e:
+            self._log_exception(type(e), e, e.__traceback__)
+            return
+        if mask is None:
+            return
+        old_komi = self.komi
+        self.komi_var.set(0.0)
+        if not self._restart_board(13, mask, "死活题", 0.0, stones):
+            self.komi_var.set(old_komi)
+            return
+        cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ"
+        fmt = lambda p: "pass" if p is None else "%s%d" % (cols[p[1]], 13 - p[0])
+        print("[死活题] 已载入，黑关键点 %s / 白关键点 %s"
+              % (fmt(bpt), fmt(wpt)))
+
     def _window_title(self):
         shape = "" if self.shape_name in ("整盘", "") else " " + self.shape_name
         if not self.ui.allow_shape:
             shape = ""
         return "%s AI - %d路%s - %s" % (
             self.ui.title, self.board_size, shape, os.path.basename(self.model_path))
+
+    def _on_reload_model(self):
+        """重新读 model.pt（训练时被原地原子覆盖），只换权重、不重置对局。
+
+        棋盘、手数、历史全部保留：换掉推理器和 MCTS 之后，按**当前局面**重建
+        根节点并重启搜索，这样训练跑着的时候可以随时切到最新权重接着下。
+        加载失败时不改任何状态（只弹错误框），避免留下「树已废、模型没换」的
+        半初始化状态。
+        """
+        path = self.model_path
+        if not os.path.exists(path):
+            messagebox.showerror("刷新模型", "找不到权重文件：\n%s" % path)
+            return
+        try:
+            from model import PolicyValueNet
+            from trt_engine import (make_evaluator, TrtEvaluator,
+                                    architecture_hash)
+            model = PolicyValueNet.load_model(path, device=self.device)
+            # 引擎已加载时只做 refit（几十毫秒）；重新 make_evaluator 要重建
+            # TensorRT 引擎，实测 25 秒，刷新按钮不能那个速度。
+            ev = self.evaluator
+            evaluator = None
+            if (isinstance(ev, TrtEvaluator)
+                    and architecture_hash(model) == architecture_hash(ev.model)
+                    and ev.refit_from_model(model)):
+                ev.model = model
+                fallback = getattr(ev, "_fallback", None)
+                if fallback is not None:
+                    fallback.model = model
+                evaluator = ev
+            if evaluator is None:
+                evaluator = make_evaluator(
+                    model, board_size=self.board_size, device=self.device,
+                    max_batch=BATCH_SIZE_MCTS, use_tensorrt=True,
+                    trt_engine_dir=self.ui.trt_engine_dir,
+                    log=lambda msg: print(msg, flush=True))
+            old = self.mcts
+            mcts = MCTS(evaluator=evaluator,
+                        c_puct=old.c_puct, num_simulations=old.num_simulations,
+                        temperature=old.temperature, alpha=old.alpha,
+                        dirichlet_alpha=old.dirichlet_alpha,
+                        dirichlet_epsilon=old.dirichlet_epsilon,
+                        board_size=self.board_size, batch_size=old.batch_size,
+                        cap=_gui_cap(self.board_size),
+                        fpu_reduction=old.fpu_reduction,
+                        virtual_loss=old.vloss, rules=self.rules)
+        except Exception as e:
+            self._log_exception(type(e), e, e.__traceback__)
+            messagebox.showerror("刷新模型",
+                                 "加载失败：\n%s: %s" % (type(e).__name__, e))
+            return
+        self._search_gen += 1                 # 作废进行中的搜索
+        self.model, self.evaluator, self.mcts = model, evaluator, mcts
+        self._rebuild_tree_and_search()
+        print("[GUI] 模型已刷新: %s" % path, flush=True)
 
     def _apply_params(self):
         self._search_gen += 1
@@ -848,6 +1145,14 @@ class GameGUI:
                 self.komi = new_komi
                 self.game.komi = new_komi  # 更新当前游戏的贴目
                 self._update_score_diff()   # 更新显示
+        if self.ui.allow_komi and hasattr(self, "komi_bias_var"):
+            try:
+                bias = float(self.komi_bias_var.get())
+            except Exception:
+                bias = float(getattr(self.game, "model_komi_bias", 0.0))
+                self.komi_bias_var.set(bias)
+            # 只改模型输入；self.game.komi 与所有结算逻辑保持不变
+            self.game.model_komi_bias = bias
         try:
             self.mcts.root = None
             self.mcts.init_root(self.game)

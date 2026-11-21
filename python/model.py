@@ -4,8 +4,8 @@ Input contract
 --------------
 ``x``: (B, INPUT_CHANNELS, n, n) spatial planes.  These contain only
 *spatially varying* features; komi/rules/global scalars are **not** planes.
-``g``: (B, GLOBAL_DIM) global vector.  Today GLOBAL_DIM == 1 (signed komi),
-but every layer reads the dimension from the config so it can grow later.
+``g``: (B, GLOBAL_DIM) global vector (komi + counts; see hyperparams).
+Every layer reads the dimension from the config so it can grow later.
 
 Output contract is unchanged:
 ``policy`` (B, n*n+1), ``value`` (B, 1), ``ownership_raw`` (B, 1, n, n),
@@ -46,7 +46,9 @@ class GlobalPoolBias(nn.Module):
         h = int(hidden or max(8, channels // 4))
         self.fc1 = nn.Linear(2 * self.pool_channels, h)
         self.fc2 = nn.Linear(h, channels)
-        nn.init.zeros_(self.fc2.weight)
+        # 非零但幅度受控：kaiming 的 6.5 范数会让"全局偏置/stem 输出"达到 1.15，
+        # 相当于给每个位置盖一层随机偏置，起步损失被抬高、下降变慢。这里用 std=0.01。
+        nn.init.normal_(self.fc2.weight, std=0.01)
         nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
@@ -70,7 +72,7 @@ class GlobalFeatureBias(nn.Module):
         h = int(hidden or max(8, channels // 4))
         self.fc1 = nn.Linear(int(global_dim), h)
         self.fc2 = nn.Linear(h, channels)
-        nn.init.zeros_(self.fc2.weight)
+        nn.init.normal_(self.fc2.weight, std=0.01)
         nn.init.zeros_(self.fc2.bias)
 
     def forward(self, g):
@@ -130,14 +132,15 @@ class PreActResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    FORMAT_VERSION = 13
-    ARCHITECTURE = 'go-katago-lite-v11'
+    FORMAT_VERSION = 26
+    ARCHITECTURE = 'go-katago-lite-v17'
 
     def __init__(self, board_size=BOARD_SIZE, input_channels=INPUT_CHANNELS,
                  global_dim=GLOBAL_DIM, channels=CHANNELS,
                  num_res_blocks=NUM_RES_BLOCKS, head_channels=None,
                  dropout_rate=DROPOUT_RATE, input_kernel=INPUT_KERNEL,
-                 gpool_blocks=GPOOL_BLOCKS, boundary_channel=None):
+                 gpool_blocks=GPOOL_BLOCKS, boundary_channel=None,
+                 block_drop=0.0, block_drop_blocks=()):
         super().__init__()
         self.board_size = int(board_size)
         self.input_channels = int(input_channels)
@@ -165,6 +168,9 @@ class PolicyValueNet(nn.Module):
         nn.init.normal_(self.global_skip.weight, std=float(GLOBAL_INIT_STD))
 
         gp = set(self.gpool_blocks)
+        # 训练时随机抽掉整块的残差分支（stochastic depth）。空列表 = 所有块。
+        self.block_drop = float(block_drop)
+        self.block_drop_blocks = tuple(int(i) for i in block_drop_blocks)
         self.blocks = nn.ModuleList([
             PreActResBlock(self.channels, gpool=(i + 1) in gp,
                            dropout_rate=self.dropout_rate)
@@ -206,7 +212,12 @@ class PolicyValueNet(nn.Module):
                             dtype=x.dtype, device=x.device)
         out = self.conv_input(x)
         out = out + self.global_bias(g) + self.global_skip(g).view(-1, self.channels, 1, 1)
-        for block in self.blocks:
+        drop_p = self.block_drop if self.training else 0.0
+        drop_set = self.block_drop_blocks
+        for i, block in enumerate(self.blocks):
+            if drop_p > 0.0 and (not drop_set or i in drop_set):
+                if torch.rand(()).item() < drop_p:
+                    continue                    # 整块跳过（恒等）
             out = block(out)
         out = F.relu(self.norm_out(out))
 
@@ -273,6 +284,8 @@ class PolicyValueNet(nn.Module):
             'dropout_rate': self.dropout_rate,
             'input_kernel': self.input_kernel,
             'gpool_blocks': list(self.gpool_blocks),
+            'block_drop': self.block_drop,
+            'block_drop_blocks': list(self.block_drop_blocks),
             'boundary_channel': self.boundary_channel,
         }, path)
 
@@ -324,6 +337,12 @@ class PolicyValueNet(nn.Module):
                 n_frozen += param.numel()
         return n_frozen
 
+    def set_block_drop(self, p, blocks=None):
+        """训练时随机抽掉整块：p 为概率，blocks 为空表示所有块。"""
+        self.block_drop = float(max(0.0, min(1.0, p)))
+        self.block_drop_blocks = tuple(int(i) for i in (blocks or ()))
+        return self.block_drop, self.block_drop_blocks
+
     def reset_norm(self):
         """Reset all RMSNorm affine parameters to weight=1, bias=0."""
         n = 0
@@ -357,6 +376,8 @@ class PolicyValueNet(nn.Module):
             input_kernel=checkpoint.get('input_kernel', INPUT_KERNEL),
             gpool_blocks=checkpoint.get('gpool_blocks', GPOOL_BLOCKS),
             boundary_channel=checkpoint.get('boundary_channel', CH_BOUNDARY),
+            block_drop=checkpoint.get('block_drop', 0.0),
+            block_drop_blocks=checkpoint.get('block_drop_blocks', ()),
         )
         try:
             model.load_state_dict(checkpoint['model_state_dict'], strict=True)

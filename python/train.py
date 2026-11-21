@@ -1,6 +1,6 @@
 """本机单进程训练：SelfPlayTrainer + 紧凑回放 + 唯一 model.pt。
 
-训练只加载当前 KataGo-lite 架构（空间 11 通道 + 6 维全局；旧架构明确拒绝）；
+训练只加载当前 KataGo-lite 架构（空间 9 通道 + 6 维全局；旧架构明确拒绝）；
 全项目只有一个权重 model.pt，保存时原地原子覆盖。
 """
 import copy
@@ -12,14 +12,15 @@ import torch
 import torch.nn.functional as F
 
 from hyperparams import (BOARD_SIZE, NUM_SIMULATIONS, C_PUCT, BATCH_SIZE,
-                         GRAD_ACCUM_STEPS, LEARNING_RATE, GPOOL_LR,
+                         GRAD_ACCUM_STEPS, LEARNING_RATE,
                          WEIGHT_DECAY, MOMENTUM,
                          OPTIMIZER_NAME, WARMUP_STEPS, ENTROPY_TARGET,
                          ENTROPY_HINGE_WEIGHT, OWN_WEIGHT, WIN_WEIGHT, GLOBAL_LR,
                          GRAD_CLIP_NORM, DATA_DIR, MODEL_PATH, TRAINING_DATA_MAX,
                          PYTORCH_CUDA_ALLOC_CONF, BATCH_SIZE_MCTS,
-                         EMA_ENABLED, EMA_DECAY)
-from model import PolicyValueNet, GlobalPoolBias
+                         EMA_ENABLED, EMA_DECAY, OWN_MACRO_WEIGHT,
+                         CH_LAST_MOVE, AUG_LAST_MOVE_DROP)
+from model import PolicyValueNet
 from replay import TrainingData
 from rules_adapter import GO_RULES
 from trt_engine import make_evaluator
@@ -103,8 +104,15 @@ class SelfPlayTrainer:
         return torch.optim.Adam(groups, lr=self.learning_rate)
 
     @staticmethod
-    def _augment_batch(states, policies, values, ownerships, own_masks, board_size):
+    def _augment_batch(states, policies, values, ownerships, own_masks, board_size,
+                       own_knowns=None):
         """只做 D4 八对称几何增强，不做黑白互换。策略 pass 位保持不变。
+
+        另外按 AUG_LAST_MOVE_DROP（默认 0.5）把「上一手」整通道清零：
+        自对弈数据里上一手是极强的提示，模型容易只学「贴着对手应」；
+        抹掉一半之后，要么自己判断要点，要么只能从棋子分布推。
+        「上一手」是一整张平面，与 D4 几何变换互不影响，故放在变换之后置 0；
+        推理/MCTS 侧永远给真实上一手，所以模型两种输入都必须应付得来。
 
         为什么删掉黑白互换：贴目固定给白方，棋局对黑白并不对称。
         把颜色互换后，同一局面的「当前行棋方」从欠贴目变成含贴目（或反过来），
@@ -146,31 +154,46 @@ class SelfPlayTrainer:
         out_v = np.array(values, dtype=np.float32, copy=True)
         out_o = np.empty_like(ownerships, dtype=np.int8)
         out_m = np.array(own_masks, dtype=np.uint8, copy=True)
+        out_k = (None if own_knowns is None
+                 else np.empty_like(own_knowns, dtype=np.uint8))
+        drop_last = (np.random.random(batch_size) < AUG_LAST_MOVE_DROP
+                     if AUG_LAST_MOVE_DROP > 0 else None)
         for i in range(batch_size):
             t = np.random.randint(len(transforms))
             out_s[i] = transforms[t][0](states[i])
+            if drop_last is not None and drop_last[i]:
+                out_s[i, CH_LAST_MOVE] = 0.0
             out_p[i] = transforms[t][1](policies[i])
             out_o[i] = own_funcs[t](ownerships[i])
-        return out_s, out_p, out_v, out_o, out_m
+            if out_k is not None:
+                out_k[i] = own_funcs[t](own_knowns[i])
+        return out_s, out_p, out_v, out_o, out_m, out_k
 
     @staticmethod
-    def _ownership_loss_mask(own_target, own_mask, valid):
+    def _ownership_loss_mask(own_target, own_mask, valid, own_known=None):
         """归属损失的样本掩码：**所有格子都参与**。
 
         可落子点按标签训练（目标 0 的中立/单官点也参与，让归属头学会在这些点输出 0）；
         洞（valid=False）同样纳入，目标固定为 0。
         实测（13/14/19 路末段）中立点长期没有梯度，模型在单官/中立区平均输出 |0.8~0.9|，
         19 路每局约 6 个中立点、每手能贡献 ~5 目目差误差，所以必须监督。
+
+        ``own_known`` 是逐点掩码（认输局：Benson 无条件活只标了确定的部分），
+        False 的点不参与损失 —— 死活不明的点不能硬塞一个标签。
         """
-        return own_mask.expand_as(own_target)
+        mask = own_mask.expand_as(own_target)
+        if own_known is not None:
+            mask = mask & own_known.bool()
+        return mask
 
     def train_step(self, batch_size=BATCH_SIZE):
         if len(self.data_buffer) < batch_size:
             return (None,) * self.LOSS_N
-        states, globals_, policies, values, ownerships, own_masks = \
-            self.data_buffer.sample(batch_size)
-        states, policies, values, ownerships, own_masks = self._augment_batch(
-            states, policies, values, ownerships, own_masks, self.board_size)
+        states, globals_, policies, values, ownerships, own_masks, scores, \
+            own_knowns, macro_masks = self.data_buffer.sample_with_scores(batch_size)
+        states, policies, values, ownerships, own_masks, own_knowns = \
+            self._augment_batch(states, policies, values, ownerships, own_masks,
+                                self.board_size, own_knowns)
         states_t = torch.from_numpy(states).to(self.device)
         globals_t = torch.from_numpy(globals_).to(self.device)
         policies_t = torch.from_numpy(policies).to(self.device)
@@ -186,10 +209,11 @@ class SelfPlayTrainer:
         own_logit = own_logits.squeeze(1)
         own_target = torch.from_numpy(ownerships).to(self.device).float()
         own_mask = torch.from_numpy(own_masks).to(self.device).bool().view(-1, 1, 1)
+        own_known = torch.from_numpy(own_knowns).to(self.device).bool()
         # 边界通道 -1 = 洞。可落子点只训练非 0 标签；洞内也参与损失，目标 0。
         valid = torch.from_numpy(
             states[:, self.model.boundary_channel] >= 0.0).to(self.device).bool()
-        mask = self._ownership_loss_mask(own_target, own_mask, valid)
+        mask = self._ownership_loss_mask(own_target, own_mask, valid, own_known)
         if not mask.any():
             own_loss = torch.zeros((), device=self.device)
         else:
@@ -201,6 +225,18 @@ class SelfPlayTrainer:
 
         win_target = (torch.from_numpy(values).to(self.device).float() + 1.0) / 2.0
         win_loss = F.binary_cross_entropy_with_logits(2.0 * win_logits.squeeze(1), win_target)
+
+        # 宏观领地项：预测的 Σtanh(own)（行棋方视角、不含贴目）与实际终局目差之差，
+        # 按有效面积归一化后平方（除以面积，避免平方后尺度过大），直接并入平均领地损失。
+        # 只对有真实终局目差的局算：截断局、不训归属的棋种、认输局（目差未知）都跳过。
+        # 完美预测时该项为 0；13 路终局若不为 0，说明贴目/目差口径不一致。
+        use_macro = (torch.from_numpy(macro_masks).to(self.device).bool()
+                     & own_mask.view(-1))
+        if bool(use_macro.any()):
+            area = valid.sum(dim=(1, 2)).to(own_logit.dtype).clamp_min(1.0)
+            pred_sum = (torch.tanh(own_logit) * valid).sum(dim=(1, 2))
+            diff = (pred_sum - torch.from_numpy(scores).to(self.device).float()) / area
+            own_loss = own_loss + OWN_MACRO_WEIGHT * (diff * diff)[use_macro].mean()
 
         # 目差信号由归属头逐点求和承担（分数头已删除）。
         excess = (entropy - ENTROPY_TARGET).clamp(min=0.0)
@@ -217,8 +253,7 @@ class SelfPlayTrainer:
             # warmup 必须在 step 之前改 lr：放在 step 之后，第一次更新就会直接
             # 吃满学习率 —— 而 warmup 要避开的恰恰是这一步。
             self._apply_warmup()
-            # 放大也要在裁剪之前：先裁后放大等于这两类参数完全绕过 GRAD_CLIP_NORM。
-            self._boost_gpool_grads()
+            # 放大也要在裁剪之前：先裁后放大等于这类参数完全绕过 GRAD_CLIP_NORM。
             self._boost_global_grads()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
             self.optimizer.step()
@@ -226,17 +261,6 @@ class SelfPlayTrainer:
             self._accum_steps_done = 0
         return (policy_loss.item(), own_loss.item(), entropy.item(),
                 win_loss.item(), total_loss.item())
-
-    def _boost_gpool_grads(self):
-        if GPOOL_LR <= 0 or self.learning_rate <= 0:
-            return
-        mult = GPOOL_LR / self.learning_rate
-        for m in self.model.modules():
-            if not isinstance(m, GlobalPoolBias):
-                continue
-            for p in (m.fc1.weight, m.fc1.bias, m.fc2.weight, m.fc2.bias):
-                if p.grad is not None:
-                    p.grad *= mult
 
     def _boost_global_grads(self):
         """只放大「新增的全局特征列」的梯度，贴目列保持原学习率。
@@ -278,7 +302,6 @@ class SelfPlayTrainer:
                 p.grad.mul_(mult)
         self._opt_steps += 1
         self._apply_warmup()
-        self._boost_gpool_grads()
         self._boost_global_grads()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
         self.optimizer.step()
@@ -336,6 +359,13 @@ class SelfPlayTrainer:
         return self.data_buffer.save_game(payload)
 
     def update_hyperparameters(self, **kwargs):
+        if "block_drop" in kwargs or "block_drop_blocks" in kwargs:
+            p = kwargs.pop("block_drop", None)
+            bl = kwargs.pop("block_drop_blocks", None)
+            cur_p = getattr(self.model, "block_drop", 0.0)
+            cur_b = getattr(self.model, "block_drop_blocks", ())
+            self.model.set_block_drop(cur_p if p is None else float(p),
+                                      cur_b if bl is None else bl)
         if "learning_rate" in kwargs:
             self.learning_rate = kwargs["learning_rate"]
             for g in self.optimizer.param_groups:

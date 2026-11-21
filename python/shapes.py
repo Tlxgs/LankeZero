@@ -25,6 +25,10 @@ EMPTY_CHARS = frozenset(". ")
 BLACK_CHARS = frozenset("Xx")
 WHITE_CHARS = frozenset("Oo")
 
+# 死活题额外标注：'b' 黑的关键点、'w' 白的关键点、'*' 同一个点。
+# 三个字符都**不是棋子**，标在空点上；普通形状文件里出现它们会被当成非法字符。
+MARK_CHARS = frozenset("bw*")
+
 
 # ---------------- 基本校验 ----------------
 
@@ -128,6 +132,9 @@ def ring(n, thickness=1):
 
 SHAPE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shapes")
+# 死活题单独一个目录，和棋盘形状分开：那边的文件带 b/w/* 标注，这里的不带。
+LD_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ld")
 
 
 def shape_file(name):
@@ -155,6 +162,33 @@ def save_shape_file(path, mask, stones=None):
     return path
 
 
+# ---------------- 死活题文件 ----------------
+
+def ld_file(name):
+    """把题名解析成 ld/ 下的文件路径。"""
+    name = str(name).strip()
+    if name.endswith(".txt") or os.path.sep in name:
+        return os.path.abspath(name)
+    return os.path.join(LD_DIR, name + ".txt")
+
+
+def load_ld_file(path, board_size=None):
+    """读死活题文件，返回 (洞掩码, 棋子, 黑关键点, 白关键点)。"""
+    with open(path, "r", encoding="utf-8") as f:
+        return from_text_ld(f.read(), board_size=board_size)
+
+
+def save_ld_file(path, mask, stones=None, black_pt=None, white_pt=None):
+    """写死活题文件（棋盘 + 两个标注点）。"""
+    path = os.path.abspath(path)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(to_text_ld(mask, stones, black_pt, white_pt) + "\n")
+    return path
+
+
 # ---------------- 文本互转 ----------------
 
 def from_text(text, board_size=None):
@@ -162,11 +196,10 @@ def from_text(text, board_size=None):
     return from_text_board(text, board_size=board_size)[0]
 
 
-def from_text_board(text, board_size=None):
-    """把 ASCII 画出来的棋盘/开局转成 (掩码, 棋子)。
+def _parse_board(text, board_size=None, allow_marks=False):
+    """文本 → (掩码, 棋子, 黑关键点, 白关键点)。
 
-    允许的字符：'#' = 洞，'.' / 空格 = 空点，'X'/'x' = 黑子，'O'/'o' = 白子；
-    空行忽略。所有行必须等长。
+    allow_marks=False 时不认识 b/w/*，保证普通形状文件不会被误当成死活题。
     """
     rows = [ln.rstrip("\n") for ln in str(text).splitlines() if ln.strip()]
     if not rows:
@@ -180,6 +213,7 @@ def from_text_board(text, board_size=None):
         raise ValueError("形状边长 %d != 棋盘 %d" % (n, int(board_size)))
     m = np.zeros((n, n), dtype=bool)
     stones = np.zeros((n, n), dtype=np.int8)
+    black_pt = white_pt = None
     for r, ln in enumerate(rows):
         for c, ch in enumerate(ln):
             if ch in HOLE_CHARS:
@@ -188,13 +222,47 @@ def from_text_board(text, board_size=None):
                 stones[r, c] = 1
             elif ch in WHITE_CHARS:
                 stones[r, c] = -1
-            elif ch not in EMPTY_CHARS:
+            elif ch in EMPTY_CHARS:
+                pass
+            elif allow_marks and ch == "b":
+                if black_pt is not None:
+                    raise ValueError("黑关键点只能标一个")
+                black_pt = (r, c)
+            elif allow_marks and ch == "w":
+                if white_pt is not None:
+                    raise ValueError("白关键点只能标一个")
+                white_pt = (r, c)
+            elif allow_marks and ch == "*":
+                if black_pt is not None or white_pt is not None:
+                    raise ValueError("'*' 只能单独用（黑白共点）")
+                black_pt = white_pt = (r, c)
+            else:
                 raise ValueError("第 %d 行第 %d 列出现无法识别的字符 %r"
                                  % (r + 1, c + 1, ch))
     m = validate_mask(m)
     if stones.any() and (stones[m] != 0).any():
         raise ValueError("洞上不能放棋子")
+    return m, stones, black_pt, white_pt
+
+
+def from_text_board(text, board_size=None):
+    """把 ASCII 画出来的棋盘/开局转成 (掩码, 棋子)。
+
+    允许的字符：'#' = 洞，'.' / 空格 = 空点，'X'/'x' = 黑子，'O'/'o' = 白子；
+    空行忽略。所有行必须等长。
+    """
+    m, stones, _b, _w = _parse_board(text, board_size, allow_marks=False)
     return m, (stones if stones.any() else None)
+
+
+def from_text_ld(text, board_size=None):
+    """把 ASCII 画出来的死活题转成 (掩码, 棋子, 黑关键点, 白关键点)。
+
+    字符同上，额外允许 'b'（黑关键点）、'w'（白关键点）、'*'（黑白同一点）。
+    关键点必须落在空点上，坐标是 (行, 列)，行从上往下、列从左往右。
+    """
+    m, stones, bpt, wpt = _parse_board(text, board_size, allow_marks=True)
+    return m, (stones if stones.any() else None), bpt, wpt
 
 
 def to_text(mask):
@@ -219,6 +287,36 @@ def to_text_board(mask, stones=None):
                 row.append("X")
             elif st[r, c] == -1:
                 row.append("O")
+            else:
+                row.append(".")
+        out.append("".join(row))
+    return "\n".join(out)
+
+
+def to_text_ld(mask, stones=None, black_pt=None, white_pt=None):
+    """掩码 + 棋子 + 两个关键点转回 ASCII（死活题格式）。"""
+    m = np.asarray(mask, dtype=bool)
+    n = m.shape[0]
+    st = (np.zeros((n, n), dtype=np.int8) if stones is None
+          else np.asarray(stones, dtype=np.int8))
+    bp = None if black_pt is None else (int(black_pt[0]), int(black_pt[1]))
+    wp = None if white_pt is None else (int(white_pt[0]), int(white_pt[1]))
+    out = []
+    for r in range(n):
+        row = []
+        for c in range(n):
+            if m[r, c]:
+                row.append("#")
+            elif st[r, c] == 1:
+                row.append("X")
+            elif st[r, c] == -1:
+                row.append("O")
+            elif bp == (r, c) and wp == (r, c):
+                row.append("*")
+            elif bp == (r, c):
+                row.append("b")
+            elif wp == (r, c):
+                row.append("w")
             else:
                 row.append(".")
         out.append("".join(row))

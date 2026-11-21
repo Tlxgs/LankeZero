@@ -207,10 +207,10 @@ def read_sgf(path, min_moves, max_moves):
     if handicap != 0:
         raise SkipGame("handicap")
     komi = norm_komi(get_prop(root, "KM", ""))
-    if komi is None or not np.isfinite(komi) or komi < 0.0 or komi > 100.0:
+    # 负数贴目 = 倒贴目，照收；只拒绝非有限值和离谱范围。
+    if komi is None or not np.isfinite(komi) or komi < -100.0 or komi > 100.0:
         raise SkipGame("bad_komi")
-    # 贴目必须是 x.5：整数贴目（大量让子局/老棋谱是 0）会让终局目差落到
-    # 分数头两个箱之间，整局直接不要。
+    # 贴目必须是 0.5 的整数倍（整数贴目也允许，负数同理）。
     if not is_half_step_komi(komi):
         raise SkipGame("komi_not_half")
     winner, score_diff = parse_result(get_prop(root, "RE", ""))

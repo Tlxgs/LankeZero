@@ -23,7 +23,7 @@ from hyperparams import (BOARD_SIZES, NUM_SIMULATIONS, BATCH_SIZE, BATCH_SIZE_MC
                          LEARNING_RATE,
                          WEIGHT_DECAY, OPTIMIZER_NAME, MOMENTUM, TRAIN_GAMES,
                          TRAIN_STEPS_PER_GAME, SAVE_INTERVAL, TRAINING_DATA_MAX,
-                         MODEL_PATH, LOG_DIR, PROJECT_ROOT, EXPLORATION_MODE)
+                         MODEL_PATH, LOG_DIR, PROJECT_ROOT)
 from model import PolicyValueNet, count_parameters
 from train import SelfPlayTrainer
 from mcts import MCTS
@@ -71,16 +71,15 @@ def build_parser():
     g.add_argument("--c-puct", type=float, default=C_PUCT)
     g.add_argument("--temperature", type=float, default=0.5)
     g.add_argument("--komi", type=float, default=None,
-                   help="每局贴目（默认 hyperparams.KOMI）；让子开局固定贴 0 目")
+                   help="每局贴目（默认 hyperparams.KOMI；负数 = 倒贴目）")
     g.add_argument("--alpha", type=float, default=ALPHA,
                    help="胜率/目差混合系数，0=纯胜率，1=纯目差")
     g.add_argument("--vloss", type=int, default=VIRTUAL_LOSS)
+    g.add_argument("--pcr-prob", type=float, default=0.0,
+                   help="快速走子：每手做全搜索的概率（0=关闭）。"
+                        "其余手用 1/6 访问数且不进训练数据")
     g.add_argument("--dir-alpha", type=float, default=DIRICHLET_ALPHA)
     g.add_argument("--dir-eps", type=float, default=DIRICHLET_EPSILON)
-    g.add_argument("--exploration", dest="exploration", action="store_true",
-                   default=EXPLORATION_MODE,
-                   help="让子开局：13 路以上黑先摆 1~4 个角星位，贴 0 目（有洞的棋盘自动关闭）")
-    g.add_argument("--no-exploration", dest="exploration", action="store_false")
 
     # 数据 / 模型
     g = p.add_argument_group("数据与模型")
@@ -228,8 +227,6 @@ def main():
                   shapes.playable_area(args.hole_mask),
                   args.games, args.sims, args.temperature,
                   args.alpha, args.dir_alpha, args.dir_eps))
-        if args.hole_mask.any() and args.exploration and not args.train_only:
-            logger("提示: 棋盘有洞时让子开局自动关闭，避免落进洞里")
         logger("model=%s data=%s device=%s batch=%d steps=%d lr=%g"
                % (args.model, args.data_dir, args.device, args.batch,
                   args.steps, args.lr))
@@ -325,9 +322,9 @@ def _selfplay(trainer, args, logger):
         result = play_one_game(
             mcts=mcts, board_size=args.board_size, num_simulations=args.sims,
             device=args.device, c_puct=args.c_puct,
-            temperature=args.temperature, exploration=args.exploration,
+            temperature=args.temperature,
             on_move=on_move, hole_mask=args.hole_mask, komi=args.komi,
-            start_stones=args.start_stones)
+            start_stones=args.start_stones, pcr_prob=args.pcr_prob)
         if result["payload"] is None or not result["complete"]:
             logger("自对弈未正常结束，丢弃本局（%d/%d）" % (attempts, max_attempts))
             continue

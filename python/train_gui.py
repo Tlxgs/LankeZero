@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import queue
+import random
 import threading
 import time
 import traceback
@@ -19,20 +20,19 @@ from datetime import datetime
 
 import numpy as np
 
-from game import PASS_MOVE, position_legal_mask
+from game import PASS_MOVE
 from hyperparams import (BOARD_SIZE, DATA_DIR, NUM_SIMULATIONS,
-                         KOMI, C_PUCT, TEMPERATURE, EXPLORATION_MODE, BATCH_SIZE,
+                         KOMI, C_PUCT, TEMPERATURE, BATCH_SIZE,
                          SAVE_INTERVAL, TRAIN_GAMES, LEARNING_RATE,
                          WEIGHT_DECAY, MOMENTUM, OPTIMIZER_NAME,
                          UI_UPDATE_BATCHES, SAVE_INTERVAL_BATCHES, ALPHA,
                          TRAIN_STEPS_PER_GAME, BATCH_SIZE_MCTS, VIRTUAL_LOSS,
                          DIRICHLET_ALPHA, DIRICHLET_EPSILON, GUI_MAX_SIMS,
+                         PCR_ENABLED, PCR_PROB, PCR_FAST_DIV, RESIGN_THRESHOLD,
                          board_temperature_zero_for_area, LOG_DIR)
 import shapes
 from ui_utils import GameBoard, TrainingStatsPanel
 from selfplay import play_one_game
-from replay import (DATA_VERSION, SUPPORTED_DATA_VERSIONS, load_npz_arrays,
-                    policy_segment, set_policy_onehot)
 from rules_adapter import GO_RULES
 
 if sys.platform == "win32":
@@ -46,21 +46,47 @@ SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "train_gui_settings.json")
 
 
+def snap_half_step(value, minimum=0.0):
+    """把输入夹到 [minimum, +∞) 并对齐到 0.5 的整数倍（非法值按 minimum 处理）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(minimum)
+    if not np.isfinite(v) or v < minimum:
+        v = float(minimum)
+    return round(v * 2.0) / 2.0
+
+
+def sample_komi(base, span, rng=None):
+    """每局贴目：在 base±span 的 0.5 格点上均匀抽一个。
+
+    span=0 时原样返回 base —— 保持「固定贴目」的旧行为。
+    例：base=6.5、span=1.5 → 5.0/5.5/…/8.0 共 7 个值，各 1/7。
+    base 本身不在 0.5 格点上时先对齐（数据加载器只接受 0.5 的整数倍）。
+    """
+    span = snap_half_step(span)
+    if span <= 0.0:
+        return float(base)
+    base = round(float(base) * 2.0) / 2.0
+    steps = int(round(span * 2.0))
+    return base + 0.5 * int((random if rng is None else rng).randint(-steps, steps))
+
+
 class GameResult:
     __slots__ = ("game_id", "moves", "players", "winner", "board_size", "hole_mask",
-                 "label_game", "score_diff", "start_stones")
+                 "score_diff", "start_stones", "resigned")
 
     def __init__(self, game_id, moves, winner, board_size=BOARD_SIZE, hole_mask=None,
-                 label_game=None, score_diff=0.0, start_stones=None):
+                 score_diff=0.0, start_stones=None, resigned=False):
         self.game_id = game_id
         self.winner = winner
         self.score_diff = float(score_diff)      # 黑视角目差；认输/截断局为 0
+        self.resigned = bool(resigned)           # 认输结束（没有终局目差/归属）
         self.board_size = int(board_size)
         self.hole_mask = (shapes.solid(self.board_size) if hole_mask is None
                           else np.asarray(hole_mask, dtype=bool))
         self.start_stones = (None if start_stones is None
                              else np.asarray(start_stones, dtype=np.int8))
-        self.label_game = label_game
         n = self.board_size + 1
         arr = array("h")
         pl = array("b")
@@ -78,119 +104,16 @@ class GameResult:
                 for code in self.moves]
 
 
-def result_text(winner, score_diff=0.0):
+def result_text(winner, score_diff=0.0, resigned=False):
     """对局结果文字：胜方 + 目差。score_diff 是黑视角目差，没有目差（认输/截断）时只显示胜方。"""
     if winner == 0:
         return "平局"
     side = "黑胜" if winner == 1 else "白胜"
+    if resigned:
+        return side + "（认输）"
     if abs(float(score_diff)) < 1e-6:
         return side
     return "%s %.1f 目" % (side, abs(float(score_diff)))
-
-
-class LabelGame:
-    """从磁盘 .npz 读出的可标注对局。
-
-    棋盘用 samples 里的 boards 重建，所以显示的是「该样本落子前」的局面；
-    原来的目标着法不会以棋子形式出现在盘上。
-    """
-    __slots__ = ("path", "arrays", "board_size", "hole_mask", "count", "winner",
-                 "score_diff")
-
-    def __init__(self, path, arrays=None):
-        self.path = None if path is None else os.path.abspath(path)
-        if arrays is None:
-            if self.path is None:
-                raise ValueError("没有数据文件")
-            arrays = load_npz_arrays(self.path)
-        self.arrays = arrays
-        a = self.arrays
-        for key in ("version", "board_size", "boards", "players", "lasts",
-                    "legals", "moves", "pol_len", "pol_idx", "pol_p"):
-            if key not in a:
-                raise ValueError("缺少键 %s" % key)
-        if int(a["version"]) not in SUPPORTED_DATA_VERSIONS:
-            raise ValueError("数据版本 %d 不受支持（支持 %s）"
-                             % (int(a["version"]), SUPPORTED_DATA_VERSIONS))
-        self.board_size = int(a["board_size"])
-        bits = a.get("hole_bits") if hasattr(a, "get") else a["hole_bits"]
-        if bits is not None and int(np.asarray(bits).size) > 0:
-            self.hole_mask = shapes.unpack_bits(bits, self.board_size)
-        else:
-            self.hole_mask = shapes.solid(self.board_size)
-        self.count = len(a["boards"])
-        if self.count <= 0:
-            raise ValueError("空对局")
-        for key in ("players", "lasts", "legals", "moves", "pol_len"):
-            if len(a[key]) != self.count:
-                raise ValueError("%s 长度 %d != 样本数 %d" % (key, len(a[key]), self.count))
-        if (int(np.asarray(a["pol_len"]).sum()) != len(a["pol_idx"])
-                or len(a["pol_idx"]) != len(a["pol_p"])):
-            raise ValueError("策略稀疏数组长度与 pol_len 不一致")
-        self.winner = int(a["winner"]) if "winner" in a else 0
-        self.score_diff = float(a["score_diff"]) if "score_diff" in a else 0.0
-
-    def board(self, i):
-        n = self.board_size
-        rel = np.asarray(self.arrays["boards"][i], dtype=np.int16).reshape(n, n)
-        return rel * int(self.arrays["players"][i])
-
-    def legal(self, i):
-        n = self.board_size
-        bits = np.unpackbits(self.arrays["legals"][i], count=n * n)
-        return bits.reshape(n, n).astype(bool)
-
-    def last_move(self, i):
-        v = int(self.arrays["lasts"][i])
-        n = self.board_size
-        if 0 <= v < n * n:
-            return v // n, v % n
-        return None
-
-    def player(self, i):
-        return int(self.arrays["players"][i])
-
-    def target_move(self, i):
-        """原实战目标着法；pass 返回 None。"""
-        code = int(self.arrays["moves"][i])
-        if code == 0:
-            return None
-        n1 = self.board_size + 1
-        return code // n1 - 1, code % n1 - 1
-
-    def move_index(self, r, c):
-        return int(r) * self.board_size + int(c)
-
-    def move_text(self, index):
-        n = self.board_size
-        i = int(index)
-        if i == n * n:
-            return "Pass"
-        return "(%d,%d)" % (i // n, i % n)
-
-    def top_policy(self, i):
-        idx, pp = policy_segment(self.arrays, i)
-        if len(idx) == 0:
-            return None, 0.0
-        j = int(np.argmax(pp))
-        return int(idx[j]), float(pp[j])
-
-    def set_onehot(self, i, r, c):
-        if self.path is None:
-            raise ValueError("当前对局未保存为 .npz，无法改硬盘标签")
-        if self.hole_mask[r, c]:
-            raise ValueError("洞内不能落子")
-        board = self.board(i)
-        if board[r, c] != 0:
-            raise ValueError("该点已有棋子")
-        if not self.legal(i)[r, c]:
-            # 旧 npz 的 legals 可能带已废弃的「pass 上限」限制；按当前规则（只看提子/自杀）重算。
-            if not position_legal_mask(board, self.player(i),
-                                       self.board_size)[r, c]:
-                raise ValueError("该点不合法（提子后仍然无气）")
-        move = self.move_index(r, c)
-        self.arrays = set_policy_onehot(self.path, i, move)
-        return move
 
 
 class TrainingGUI:
@@ -198,7 +121,7 @@ class TrainingGUI:
         self.rules = rules or GO_RULES
         self.ui = self.rules.ui
         self.root = tk.Tk()
-        self.root.title("%s AI 训练（本机单进程）" % self.ui.title)
+        self.root.title("%s AI 训练" % self.ui.title)
         self.root.geometry("2000x1300")
         self.board_size = self.ui.default_size
         self.hole_mask = shapes.solid(self.board_size)
@@ -214,11 +137,6 @@ class TrainingGUI:
         self.current_game_moves = []
         self.current_game_players = []
         self.current_step = 0
-        self.view_mode = "live"
-        self.label_game = None
-        self.label_index = 0
-        self.live_label_game = None
-        self.live_label_opening = 0
         self._log_file = None
         self._settings = self._read_settings()
         self._create_widgets()
@@ -261,6 +179,8 @@ class TrainingGUI:
             "board_size": int(self.board_size_var.get()),
             "shape": shapes.to_text_board(self.hole_mask, self.start_stones),
             "komi": float(self.komi_var.get()) if hasattr(self, "komi_var") else KOMI,
+            "komi_range": (snap_half_step(self.komi_range_var.get())
+                           if hasattr(self, "komi_range_var") else 0.0),
             "device": self.device_var.get(),
             "simulations": int(self.simulations_var.get()),
             "mcts_batch": int(self.mcts_batch_var.get()),
@@ -268,17 +188,21 @@ class TrainingGUI:
             "temperature": float(self.temperature_var.get()),
             "alpha": float(self.alpha_var.get()),
             "vloss": int(self.vloss_var.get()),
+            "pcr": bool(self.pcr_var.get()),
+            "pcr_prob": float(self.pcr_prob_var.get()),
             "dir_alpha": float(self.dir_alpha_var.get()),
             "dir_eps": float(self.dir_eps_var.get()),
-            "exploration": bool(self.exploration_var.get()),
+            "resign": float(self.resign_var.get()),
             "train_only": bool(self.train_only_var.get()),
             "games": int(self.total_var.get()),
             "batch": int(self.batch_size_var.get()),
             "steps": int(self.steps_var.get()),
-            "save_interval": int(self.save_interval_var.get()),
-            "ui_interval": int(self.ui_interval_var.get()),
+            "save_interval": int(SAVE_INTERVAL),
+            "ui_interval": int(UI_UPDATE_BATCHES),
             "save_batch": int(self.save_batch_var.get()),
             "freeze": self.freeze_var.get(),
+            "block_drop": self.block_drop_var.get(),
+            "drop_blocks": self.drop_blocks_var.get(),
             "optimizer": self.optimizer_var.get(),
             "lr": float(self.lr_var.get()),
             "momentum": float(self.momentum_var.get()),
@@ -353,17 +277,19 @@ class TrainingGUI:
                 ("temperature", self.temperature_var, "float"),
                 ("alpha", self.alpha_var, "float"),
                 ("vloss", self.vloss_var, "int"),
+                ("pcr", self.pcr_var, "bool"),
+                ("pcr_prob", self.pcr_prob_var, "float"),
                 ("dir_alpha", self.dir_alpha_var, "float"),
                 ("dir_eps", self.dir_eps_var, "float"),
-                ("exploration", self.exploration_var, "bool"),
+                ("resign", self.resign_var, "float"),
                 ("train_only", self.train_only_var, "bool"),
                 ("games", self.total_var, "int"),
                 ("batch", self.batch_size_var, "int"),
                 ("steps", self.steps_var, "int"),
-                ("save_interval", self.save_interval_var, "int"),
-                ("ui_interval", self.ui_interval_var, "int"),
                 ("save_batch", self.save_batch_var, "int"),
                 ("freeze", self.freeze_var, "str"),
+                ("block_drop", self.block_drop_var, "str"),
+                ("drop_blocks", self.drop_blocks_var, "str"),
                 ("optimizer", self.optimizer_var, "str"),
                 ("lr", self.lr_var, "float"),
                 ("momentum", self.momentum_var, "float"),
@@ -376,6 +302,8 @@ class TrainingGUI:
                 self._set_var(var, s[key], kind)
         if hasattr(self, "komi_var") and "komi" in s:
             self._set_var(self.komi_var, s["komi"], "float")
+        if hasattr(self, "komi_range_var") and "komi_range" in s:
+            self._set_var(self.komi_range_var, snap_half_step(s["komi_range"]), "float")
         if self.optimizer_var.get() not in ("Adam", "SGD"):
             self.optimizer_var.set("Adam")
         if self.load_mode_var.get() not in ("newest", "random"):
@@ -409,18 +337,21 @@ class TrainingGUI:
             ttk.Spinbox(frame, from_=-25.0, to=25.0, increment=0.5,
                         textvariable=self.komi_var, width=8).grid(
                             row=4, column=1, sticky=tk.W, padx=5)
-            ttk.Label(frame, text="允许整数；让子开局固定贴 0 目",
-                      foreground="gray").grid(row=4, column=2, sticky=tk.W)
+            ttk.Label(frame, text="贴目浮动范围:").grid(row=5, column=0, sticky=tk.W)
+            self.komi_range_var = tk.DoubleVar(value=0.0)
+            ttk.Spinbox(frame, from_=0.0, to=25.0, increment=0.5,
+                        textvariable=self.komi_range_var, width=8).grid(
+                            row=5, column=1, sticky=tk.W, padx=5)
         if self.ui.allow_shape:
-            ttk.Label(frame, text="形状:").grid(row=5, column=0, sticky=tk.W)
+            ttk.Label(frame, text="形状:").grid(row=6, column=0, sticky=tk.W)
             self.shape_name = "整盘"
             self.shape_btn = ttk.Button(frame, text="编辑形状",
                                         command=self._on_shape_change, width=12)
-            self.shape_btn.grid(row=5, column=1, sticky=tk.W, padx=5)
+            self.shape_btn.grid(row=6, column=1, sticky=tk.W, padx=5)
         self.tensorrt_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frame, text="TensorRT REFIT（实验，需预建引擎）",
-            variable=self.tensorrt_var).grid(row=6, column=0, columnspan=3,
+            variable=self.tensorrt_var).grid(row=7, column=0, columnspan=3,
                                              sticky=tk.W, pady=(4, 0))
 
     def _create_mcts_settings(self, parent):
@@ -430,10 +361,9 @@ class TrainingGUI:
         self.simulations_var = tk.IntVar(value=NUM_SIMULATIONS)
         ttk.Spinbox(frame, from_=20, to=GUI_MAX_SIMS, textvariable=self.simulations_var,
                     width=10).grid(row=0, column=1, padx=5)
-        ttk.Label(frame, text="推理 batch:").grid(row=1, column=0, sticky=tk.W)
+        # 推理 batch / 虚拟损失 不再暴露到界面（固定取超参），但变量保留：
+        # 设置文件往返与 MCTS 构造都还在读它们。
         self.mcts_batch_var = tk.IntVar(value=BATCH_SIZE_MCTS)
-        ttk.Spinbox(frame, from_=1, to=64, textvariable=self.mcts_batch_var,
-                    width=10).grid(row=1, column=1, padx=5)
         ttk.Label(frame, text="c_puct:").grid(row=2, column=0, sticky=tk.W)
         self.c_puct_var = tk.DoubleVar(value=C_PUCT)
         ttk.Spinbox(frame, from_=0.0, to=10.0, increment=0.05,
@@ -446,10 +376,15 @@ class TrainingGUI:
         self.alpha_var = tk.DoubleVar(value=ALPHA)
         ttk.Spinbox(frame, from_=0.0, to=1.0, increment=0.05,
                     textvariable=self.alpha_var, width=10).grid(row=4, column=1, padx=5)
-        ttk.Label(frame, text="虚拟损失:").grid(row=5, column=0, sticky=tk.W)
         self.vloss_var = tk.IntVar(value=VIRTUAL_LOSS)
-        ttk.Spinbox(frame, from_=0, to=20, textvariable=self.vloss_var,
-                    width=10).grid(row=5, column=1, padx=5)
+        self.pcr_var = tk.BooleanVar(value=PCR_ENABLED)
+        ttk.Checkbutton(frame, text="快速走子（多数手少搜，不进训练数据）",
+                        variable=self.pcr_var).grid(
+            row=6, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(frame, text="全搜索比例:").grid(row=7, column=0, sticky=tk.W)
+        self.pcr_prob_var = tk.DoubleVar(value=PCR_PROB)
+        ttk.Spinbox(frame, from_=0.05, to=1.0, increment=0.05,
+                    textvariable=self.pcr_prob_var, width=10).grid(row=7, column=1, padx=5)
         ttk.Label(frame, text="噪声 α:").grid(row=8, column=0, sticky=tk.W)
         self.dir_alpha_var = tk.DoubleVar(value=DIRICHLET_ALPHA)
         ttk.Spinbox(frame, from_=0.001, to=1.0, increment=0.005,
@@ -458,9 +393,10 @@ class TrainingGUI:
         self.dir_eps_var = tk.DoubleVar(value=DIRICHLET_EPSILON)
         ttk.Spinbox(frame, from_=0.0, to=1.0, increment=0.05,
                     textvariable=self.dir_eps_var, width=10).grid(row=9, column=1, padx=5)
-        self.exploration_var = tk.BooleanVar(value=EXPLORATION_MODE)
-        ttk.Checkbutton(frame, text="让子开局（13路以上，1~4子，贴0目）", variable=self.exploration_var).grid(
-            row=10, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(frame, text="认输阈值:").grid(row=10, column=0, sticky=tk.W)
+        self.resign_var = tk.DoubleVar(value=RESIGN_THRESHOLD)
+        ttk.Spinbox(frame, from_=0.0, to=0.5, increment=0.01,
+                    textvariable=self.resign_var, width=10).grid(row=10, column=1, padx=5)
 
     def _create_training_settings(self, parent):
         frame = ttk.LabelFrame(parent, text="训练", padding="10")
@@ -480,21 +416,19 @@ class TrainingGUI:
         self.steps_var = tk.IntVar(value=TRAIN_STEPS_PER_GAME)
         ttk.Spinbox(frame, from_=1, to=128, textvariable=self.steps_var,
                     width=12).grid(row=3, column=1, padx=5)
-        ttk.Label(frame, text="保存间隔(局):").grid(row=4, column=0, sticky=tk.W)
-        self.save_interval_var = tk.IntVar(value=SAVE_INTERVAL)
-        ttk.Spinbox(frame, from_=1, to=10000, textvariable=self.save_interval_var,
-                    width=12).grid(row=4, column=1, padx=5)
-        ttk.Label(frame, text="UI 更新间隔(batch):").grid(row=5, column=0, sticky=tk.W)
-        self.ui_interval_var = tk.IntVar(value=UI_UPDATE_BATCHES)
-        ttk.Spinbox(frame, from_=1, to=1000, textvariable=self.ui_interval_var,
-                    width=12).grid(row=5, column=1, padx=5)
-        ttk.Label(frame, text="保存间隔(batch):").grid(row=6, column=0, sticky=tk.W)
+        ttk.Label(frame, text="保存间隔(batch):").grid(row=4, column=0, sticky=tk.W)
         self.save_batch_var = tk.IntVar(value=SAVE_INTERVAL_BATCHES)
         ttk.Spinbox(frame, from_=1, to=10000, textvariable=self.save_batch_var,
-                    width=12).grid(row=6, column=1, padx=5)
-        ttk.Label(frame, text="冻结参数(可空):").grid(row=7, column=0, sticky=tk.W)
+                    width=12).grid(row=4, column=1, padx=5)
+        ttk.Label(frame, text="冻结参数(可空):").grid(row=5, column=0, sticky=tk.W)
         self.freeze_var = tk.StringVar(value="")
-        ttk.Entry(frame, textvariable=self.freeze_var, width=24).grid(row=7, column=1, padx=5)
+        ttk.Entry(frame, textvariable=self.freeze_var, width=24).grid(row=5, column=1, padx=5)
+        ttk.Label(frame, text="块dropout(p):").grid(row=6, column=0, sticky=tk.W)
+        self.block_drop_var = tk.StringVar(value="0")
+        ttk.Entry(frame, textvariable=self.block_drop_var, width=24).grid(row=6, column=1, padx=5)
+        ttk.Label(frame, text="drop块(空=全部):").grid(row=7, column=0, sticky=tk.W)
+        self.drop_blocks_var = tk.StringVar(value="")
+        ttk.Entry(frame, textvariable=self.drop_blocks_var, width=24).grid(row=7, column=1, padx=5)
 
     def _create_optimizer_settings(self, parent):
         frame = ttk.LabelFrame(parent, text="优化器", padding="10")
@@ -581,15 +515,6 @@ class TrainingGUI:
         self.step_label.pack(side=tk.LEFT, padx=10)
         self.game_info_label = ttk.Label(frame, text="")
         self.game_info_label.pack(pady=4)
-        label_bar = ttk.Frame(frame)
-        label_bar.pack(pady=(2, 0))
-        ttk.Button(label_bar, text="打开数据文件打标签",
-                   command=self._open_label_file).pack(side=tk.LEFT, padx=4)
-        ttk.Button(label_bar, text="关闭标注",
-                   command=self._back_to_live).pack(side=tk.LEFT, padx=4)
-        self.label_info = ttk.Label(frame, text="标注：未打开数据文件", foreground="#1a5fb4")
-        self.label_info.pack(pady=2)
-        self.canvas.bind("<Button-1>", self._on_board_click)
 
     def _on_board_size_change(self, event=None):
         if self.is_training:
@@ -638,19 +563,12 @@ class TrainingGUI:
         self._save_settings()
 
     def _reset_replay_state(self):
-        """换棋盘/换形状后清掉回放与标注状态（原来这段被复制了两份）。"""
+        """换棋盘/换形状后清掉回放状态（原来这段被复制了两份）。"""
         self.game_history.clear()
         self.current_history_index = -1
         self.current_game_moves = []
         self.current_game_players = []
         self.current_step = 0
-        self.view_mode = "live"
-        self.label_game = None
-        self.label_index = 0
-        self.live_label_game = None
-        self.live_label_opening = 0
-        if hasattr(self, "label_info"):
-            self.label_info.config(text="标注：未打开数据文件", foreground="#1a5fb4")
         self.step_label.config(text="步数: 0/0")
         self.game_info_label.config(text="")
 
@@ -696,8 +614,9 @@ class TrainingGUI:
 
         - 必须用 rules.new_game：早先这里写死 GoGame，五子棋回放会把「没气」的棋子
           按围棋规则提掉，界面上就出现「五子棋吃子」。
-        - 让子开局的前 k 手全是黑子，必须一次性摆上（setup_handicap），
-          不能走 make_move 的黑白轮转 —— 否则 4 子让子会显示成 2 黑 2 白。
+        - 旧数据里可能有让子开局（开局前 k 手全是黑子），必须一次性摆上
+          （setup_handicap），不能走 make_move 的黑白轮转 —— 否则 4 子让子会
+          显示成 2 黑 2 白。新数据不再产生让子开局，这里只服务历史文件。
         - 自定义开局（start_stones）是局面的一部分，重放前先摆上；它不算手数，
           所以回放的 moves 仍然从黑棋第一手开始。
         """
@@ -708,8 +627,8 @@ class TrainingGUI:
                                    start_board=stones)
         limit = min(step, len(moves))
         start = 0
-        if start_stones is None and players is not None \
-                and getattr(self.rules, "handicap_opening", False):
+        if (start_stones is None and players is not None
+                and hasattr(game, "setup_handicap")):
             while start < limit and start < len(players) and int(players[start]) == 1:
                 start += 1
             # 普通对局的首手也是黑，k=1 时与逐手重放等价，不特判
@@ -738,231 +657,12 @@ class TrainingGUI:
         if game.last_move and game.last_move != PASS_MOVE:
             self.game_board.highlight_move(*game.last_move)
         self.step_label.config(text=f"步数: {step}/{len(moves)}")
-        self._update_live_label_info(step)
-
-    # ---------------- 磁盘样本标注 ----------------
-    def _open_label_file(self):
-        f = filedialog.askopenfilename(initialdir=self.data_dir_var.get() or ".",
-                                       filetypes=[("Go npz", "*.npz")])
-        if not f:
-            return
-        try:
-            game = LabelGame(f)
-        except Exception as e:
-            messagebox.showerror("无法打开数据文件", "%s\n\n%s" % (f, e))
-            return
-        if game.board_size != self.board_size:
-            if self.is_training:
-                messagebox.showerror("棋盘不一致",
-                                     "文件是 %d 路，当前界面 %d 路；请先停止训练再切换棋盘"
-                                     % (game.board_size, self.board_size))
-                return
-            self.board_size_var.set(game.board_size)
-            self._on_board_size_change()
-        if not np.array_equal(game.hole_mask, self.hole_mask):
-            if self.is_training:
-                messagebox.showerror("形状不一致",
-                                     "文件与当前界面的棋盘形状不同；请先停止训练再切换")
-                return
-            self.hole_mask = game.hole_mask
-            self.shape_name = "整盘" if not self.hole_mask.any() else "自定义"
-            self.shape_btn.config(text=self.shape_name)
-            self._resize_board_canvas()
-            self._reset_replay_state()
-        self.label_game = game
-        self.label_index = 0
-        self.view_mode = "label"
-        self._render_label_sample()
-        self._log_message("[标注] 已打开 %s（%d 条样本，%d 路）"
-                          % (os.path.basename(game.path), game.count, game.board_size))
-
-    def _render_label_sample(self):
-        game = self.label_game
-        if game is None or game.count == 0:
-            return
-        i = max(0, min(int(self.label_index), game.count - 1))
-        self.label_index = i
-        board = game.board(i)
-        if not np.array_equal(self.game_board.hole_mask, game.hole_mask):
-            self.game_board.set_hole(game.hole_mask)
-        self._draw_empty_board()
-        for r in range(self.board_size):
-            for c in range(self.board_size):
-                if self.game_board.is_hole(r, c):
-                    continue
-                if board[r, c] != 0:
-                    self.game_board.draw_piece(r, c, int(board[r, c]))
-        last = game.last_move(i)
-        if last is not None:
-            self.game_board.highlight_move(*last)
-        self.step_label.config(text="样本: %d/%d" % (i + 1, game.count))
-        w = game.winner
-        shape = "" if not game.hole_mask.any() else " 自定义形状"
-        self.game_info_label.config(
-            text="%s | %d路%s | %s" % (os.path.basename(game.path), game.board_size,
-                                        shape,
-                                        result_text(w, getattr(game, "score_diff", 0.0))))
-        top, prob = game.top_policy(i)
-        old = game.move_text(top) if top is not None else "--"
-        target = game.target_move(i)
-        played = "Pass" if target is None else "(%d,%d)" % target
-        player = "黑" if game.player(i) == 1 else "白"
-        self.label_info.config(
-            text="样本 %d/%d | 行棋方 %s | 原实战 %s | 当前标签 %s p=%.3f | 盘面为该样本落子前；点击空点=改为 one-hot"
-                 % (i + 1, game.count, player, played, old, prob),
-            foreground="#1a5fb4")
-
-    def _prev_label_sample(self):
-        if self.label_game is None:
-            return
-        self.label_index = max(0, self.label_index - 1)
-        self._render_label_sample()
-
-    def _next_label_sample(self):
-        if self.label_game is None:
-            return
-        self.label_index = min(self.label_game.count - 1, self.label_index + 1)
-        self._render_label_sample()
-
-    def _back_to_live(self):
-        self.view_mode = "live"
-        self.label_game = None
-        self.label_index = 0
-        if hasattr(self, "label_info"):
-            self.label_info.config(text="标注：未打开数据文件", foreground="#1a5fb4")
-        if self.game_history and 0 <= self.current_history_index < len(self.game_history):
-            self._display_game(self.game_history[self.current_history_index])
-        else:
-            self.live_label_game = None
-            self.live_label_opening = 0
-            self.game_board.set_hole(self.hole_mask)
-            self._draw_empty_board(self.start_stones)
-            self.step_label.config(text="步数: 0/0")
-            self.game_info_label.config(text="")
-
-    def _sync_buffer_label(self, path, sample_index, move):
-        """把内存回放缓冲里的同一条样本也改掉；训练中下一 batch 即生效。"""
-        if self.trainer is None:
-            return
-        path = os.path.normcase(os.path.abspath(path))
-        hit = 0
-        for s in list(self.trainer.data_buffer.data):
-            if (getattr(s, "source", None) == path
-                    and getattr(s, "index", -1) == int(sample_index)):
-                # 成对写：训练线程可能正在采样这条样本，分两次赋值会读到半新半旧。
-                s.set_policy(np.array([int(move)], dtype=np.uint16),
-                             np.array([1.0], dtype=np.float16))
-                hit += 1
-        if hit:
-            self._log_message("[标注] 内存缓冲同步 %d 条样本" % hit)
-        else:
-            self._log_message("[标注] 当前缓冲没有该样本；磁盘已改，重启训练后生效")
-
-    def _update_live_label_info(self, step):
-        """对局回放模式下，显示「当前第 n-1 手后，点击=第 n 手标签」。"""
-        if self.view_mode != "live":
-            return
-        lg = self.live_label_game
-        if lg is None:
-            self.label_info.config(
-                text="标注：当前对局未保存为 .npz（未勾选保存/未完成），无法改硬盘标签",
-                foreground="#1a5fb4")
-            return
-        i = int(step) - self.live_label_opening
-        if not 0 <= i < lg.count:
-            self.label_info.config(
-                text="标注：当前第 %d 手不是样本落子前；请调到第 %d..%d 手之间"
-                     % (step, self.live_label_opening,
-                        self.live_label_opening + lg.count - 1),
-                foreground="#1a5fb4")
-            return
-        top, prob = lg.top_policy(i)
-        old = lg.move_text(top) if top is not None else "--"
-        target = lg.target_move(i)
-        played = "Pass" if target is None else "(%d,%d)" % target
-        suffix = "" if lg.path is not None else " | 未保存，不能写盘"
-        self.label_info.config(
-            text="第 %d 手后 | 目标第 %d 手 | 样本 %d/%d | 原实战 %s | 当前标签 %s p=%.3f | 点击空点=one-hot%s"
-                 % (step, step + 1, i + 1, lg.count, played, old, prob, suffix),
-            foreground="#1a5fb4")
-
-    def _on_live_board_click(self, event):
-        lg = self.live_label_game
-        if lg is None:
-            return
-        if lg.path is None:
-            self.label_info.config(text="标注失败: 当前对局没有保存为 .npz", foreground="red")
-            return
-        i = self.current_step - self.live_label_opening
-        if not 0 <= i < lg.count:
-            self.label_info.config(
-                text="标注失败: 请先把步数调到样本落子前（第 %d..%d 手）"
-                     % (self.live_label_opening,
-                        self.live_label_opening + lg.count - 1),
-                foreground="red")
-            return
-        pos = self.game_board.coord_to_index(event.x, event.y)
-        if pos is None:
-            return
-        r, c = pos
-        try:
-            move = lg.set_onehot(i, r, c)
-        except Exception as e:
-            self.label_info.config(text="标注失败: %s" % e, foreground="red")
-            self._log_message("[标注] 失败: %s" % e)
-            return
-        self._sync_buffer_label(lg.path, i, move)
-        self._render_replay(self.current_game_moves, self.current_step,
-                            players=getattr(self, "current_game_players", None),
-                            start_stones=getattr(self, "current_game_stones", None))
-        self.label_info.config(
-            text="已写入第 %d 手（样本 %d/%d）：%s one-hot"
-                 % (self.current_step + 1, i + 1, lg.count, lg.move_text(move)),
-            foreground="green")
-        self._log_message("[标注] 第 %d 手（样本 %d/%d）-> %s one-hot"
-                          % (self.current_step + 1, i + 1, lg.count, lg.move_text(move)))
-
-    def _on_board_click(self, event):
-        if self.view_mode == "label":
-            self._on_label_board_click(event)
-        elif self.view_mode == "live":
-            self._on_live_board_click(event)
-
-    def _on_label_board_click(self, event):
-        if self.label_game is None:
-            return
-        pos = self.game_board.coord_to_index(event.x, event.y)
-        if pos is None:
-            return
-        r, c = pos
-        i = self.label_index
-        try:
-            move = self.label_game.set_onehot(i, r, c)
-        except Exception as e:
-            self.label_info.config(text="标注失败: %s" % e, foreground="red")
-            self._log_message("[标注] 失败: %s" % e)
-            return
-        self._sync_buffer_label(self.label_game.path, i, move)
-        self._render_label_sample()
-        self.label_info.config(
-            text="已写入样本 %d/%d: %s one-hot"
-                 % (i + 1, self.label_game.count,
-                    self.label_game.move_text(move)),
-            foreground="green")
-        self._log_message("[标注] 样本 %d/%d -> %s one-hot"
-                          % (i + 1, self.label_game.count, self.label_game.move_text(move)))
 
     def _display_game(self, game_result):
-        self.view_mode = "live"
         self.current_game_moves = game_result.get_moves()
         self.current_game_players = list(getattr(game_result, "players", []) or [])
         self.current_game_stones = getattr(game_result, "start_stones", None)
         self.current_step = len(self.current_game_moves)
-        self.live_label_game = getattr(game_result, "label_game", None)
-        if self.live_label_game is not None and len(self.current_game_moves) >= self.live_label_game.count:
-            self.live_label_opening = len(self.current_game_moves) - self.live_label_game.count
-        else:
-            self.live_label_opening = 0
         if not np.array_equal(game_result.hole_mask, self.game_board.hole_mask):
             self.game_board.set_hole(game_result.hole_mask)
             self._draw_empty_board()
@@ -973,31 +673,22 @@ class TrainingGUI:
         w = game_result.winner
         shape = "" if not game_result.hole_mask.any() else " 自定义形状"
         self.game_info_label.config(text=f"第 {game_result.game_id} 局 ({game_result.board_size}路{shape}) | "
-                                         + result_text(w, game_result.score_diff))
+                                         + result_text(w, game_result.score_diff,
+                                                       getattr(game_result, "resigned", False)))
 
     def _prev_game(self):
-        if self.view_mode == "label":
-            self._back_to_live()
-            return
         if not self.game_history:
             return
         self.current_history_index = max(0, self.current_history_index - 1)
         self._display_game(self.game_history[self.current_history_index])
 
     def _next_game(self):
-        if self.view_mode == "label":
-            self._back_to_live()
-            return
         if not self.game_history:
             return
         self.current_history_index = min(len(self.game_history) - 1, self.current_history_index + 1)
         self._display_game(self.game_history[self.current_history_index])
 
     def _first_step(self):
-        if self.view_mode == "label":
-            self.label_index = 0
-            self._render_label_sample()
-            return
         if self.current_game_moves:
             self.current_step = 1
             self._render_replay(self.current_game_moves, self.current_step,
@@ -1005,9 +696,6 @@ class TrainingGUI:
                             start_stones=getattr(self, "current_game_stones", None))
 
     def _prev_step(self):
-        if self.view_mode == "label":
-            self._prev_label_sample()
-            return
         if self.current_game_moves and self.current_step > 0:
             self.current_step -= 1
             self._render_replay(self.current_game_moves, self.current_step,
@@ -1015,9 +703,6 @@ class TrainingGUI:
                             start_stones=getattr(self, "current_game_stones", None))
 
     def _next_step(self):
-        if self.view_mode == "label":
-            self._next_label_sample()
-            return
         if self.current_game_moves and self.current_step < len(self.current_game_moves):
             self.current_step += 1
             self._render_replay(self.current_game_moves, self.current_step,
@@ -1044,7 +729,8 @@ class TrainingGUI:
             if cfg is not None:
                 cfg["dir_alpha"] = self.dir_alpha_var.get()
                 cfg["dir_eps"] = self.dir_eps_var.get()
-            self._log_message("[超参数] 训练中已更新 lr/wd；模拟数/c_puct/噪声从下一局生效；"
+                cfg["resign"] = float(self.resign_var.get())
+            self._log_message("[超参数] 训练中已更新 lr/wd；模拟数/c_puct/噪声/认输阈值从下一局生效；"
                               "优化器类型/动量需停止后应用")
             return
         self.trainer.update_hyperparameters(
@@ -1081,18 +767,25 @@ class TrainingGUI:
                 "temperature": self.temperature_var.get(),
                 "alpha": self.alpha_var.get(),
                 "vloss": self.vloss_var.get(),
+                "pcr": bool(self.pcr_var.get()),
+                "pcr_prob": float(self.pcr_prob_var.get()),
                 "dir_alpha": self.dir_alpha_var.get(),
                 "dir_eps": self.dir_eps_var.get(),
-                "exploration": self.exploration_var.get(),
+                "resign": float(self.resign_var.get()),
                 "komi": float(self.komi_var.get()) if hasattr(self, "komi_var") else KOMI,
+                # 每局从这个半宽里按 0.5 格点均匀抽贴目；0 = 固定贴目（旧行为）
+                "komi_range": (snap_half_step(self.komi_range_var.get())
+                               if hasattr(self, "komi_range_var") else 0.0),
                 "train_only": self.train_only_var.get(),
                 "games": self.total_var.get(),
                 "batch": self.batch_size_var.get(),
                 "steps": self.steps_var.get(),
-                "save_interval": self.save_interval_var.get(),
-                "ui_interval": self.ui_interval_var.get(),
+                "save_interval": int(SAVE_INTERVAL),
+                "ui_interval": int(UI_UPDATE_BATCHES),
                 "save_batch": self.save_batch_var.get(),
                 "freeze": self.freeze_var.get().strip() or None,
+                "block_drop": float(self.block_drop_var.get() or 0),
+                "drop_blocks": self.drop_blocks_var.get().strip(),
                 "lr": self.lr_var.get(),
                 "wd": self.wd_var.get(),
                 "optimizer": self.optimizer_var.get(),
@@ -1103,6 +796,9 @@ class TrainingGUI:
                 "load_mode": self.load_mode_var.get(),
                 "data_dir": self.data_dir_var.get().strip() or DATA_DIR,
             }
+            # 把对齐后的浮动范围回写到控件：用户填 1.3 时界面显示 1.5，与实际一致
+            if hasattr(self, "komi_range_var"):
+                self.komi_range_var.set(cfg["komi_range"])
         except Exception as exc:
             messagebox.showerror("参数错误", "参数填写有误，训练未开始：\n%s: %s"
                                  % (type(exc).__name__, exc))
@@ -1141,12 +837,25 @@ class TrainingGUI:
                 log=lambda msg: self.update_queue.put(
                     {"type": "log", "message": msg}))
             self.trainer = trainer
+            try:
+                _p = float(cfg.get("block_drop") or 0.0)
+                _bl = [int(x) for x in str(cfg.get("drop_blocks") or "")
+                       .replace("，", ",").split(",") if x.strip()]
+                if _p > 0:
+                    trainer.model.set_block_drop(_p, _bl)
+                    self.update_queue.put({"type": "log", "message":
+                                           "[训练] 块 dropout: p=%.2f 作用块=%s"
+                                           % (_p, _bl or "全部")})
+            except Exception as exc:
+                self.update_queue.put({"type": "log", "message":
+                                       "[警告] 块 dropout 参数无效: %s" % exc})
             self.update_queue.put({"type": "log", "message":
-                                   "[棋盘] %d 路 | 形状 %s（可下 %d 点）| 贴目 %.1f | 数据目录: %s | 温度 %.2f→0@%d手 | 噪声 α=%.3f ε=%.2f"
+                                   "[棋盘] %d 路 | 形状 %s（可下 %d 点）| 贴目 %s | 数据目录: %s | 温度 %.2f→0@%d手 | 噪声 α=%.3f ε=%.2f"
                                    % (cfg["board_size"],
                                       "整盘" if not cfg["hole_mask"].any() else "自定义",
                                       shapes.playable_area(cfg["hole_mask"]),
-                                      cfg["komi"],
+                                      ("%.1f±%.1f（每局按 0.5 均匀抽）" % (cfg["komi"], cfg["komi_range"])
+                                       if cfg.get("komi_range", 0.0) > 0 else "%.1f" % cfg["komi"]),
                                       cfg["data_dir"],
                                       cfg["temperature"],
                                       board_temperature_zero_for_area(
@@ -1235,6 +944,12 @@ class TrainingGUI:
                         rules=self.rules)
 
         mcts = make_mcts()
+        pcr_prob = float(cfg.get("pcr_prob") or 0.0) if cfg.get("pcr") else 0.0
+        if pcr_prob > 0.0:
+            self.update_queue.put({"type": "log", "message":
+                                   "[自对弈] 快速走子开启：全搜索比例 %.0f%%，"
+                                   "快搜索访问数 = 模拟数/%d，只有全搜索局面进训练数据"
+                                   % (pcr_prob * 100, max(1, int(PCR_FAST_DIV)))})
         games = 0
         while games < cfg["games"] and self.is_training and not self.stop_event.is_set():
             # 训练中改模拟数/c_puct 时，在局间重建搜索器；树在局间本来就会 reset。
@@ -1248,15 +963,16 @@ class TrainingGUI:
                                        % (trainer.num_simulations, trainer.c_puct,
                                           cfg["dir_alpha"], cfg["dir_eps"])})
             t0 = time.time()
+            # 每局重新抽一次贴目：komi_range=0 时原样返回 cfg["komi"]（固定贴目）
+            komi = sample_komi(cfg["komi"], cfg.get("komi_range", 0.0))
             result = play_one_game(
                 mcts=mcts, board_size=cfg["board_size"],
                 num_simulations=trainer.num_simulations,
                 device=cfg["device"], c_puct=trainer.c_puct,
-                temperature=cfg["temperature"], exploration=cfg["exploration"],
-                on_move=lambda played, ns: self.update_queue.put(
-                    {"type": "search_progress", "played": played, "samples": ns}),
+                temperature=cfg["temperature"],
                 hole_mask=cfg["hole_mask"], rules=self.rules,
-                komi=cfg["komi"], start_stones=cfg["start_stones"])
+                komi=komi, start_stones=cfg["start_stones"],
+                pcr_prob=pcr_prob, resign_threshold=cfg.get("resign", 0.0))
             if result["payload"] is None or not result["complete"]:
                 self.update_queue.put({"type": "log", "message":
                                        "[自对弈] 对局未正常结束，丢弃本局数据"})
@@ -1279,24 +995,17 @@ class TrainingGUI:
                              for i in range(trainer.LOSS_N))
             else:
                 loss = (None,) * trainer.LOSS_N
-            label_game = None
-            if result["payload"] is not None:
-                try:
-                    arr = dict(result["payload"])
-                    arr["version"] = np.int16(DATA_VERSION)
-                    arr["board_size"] = np.int16(cfg["board_size"])
-                    label_game = LabelGame(saved_path, arr)
-                except Exception as e:
-                    self.update_queue.put({"type": "log", "message":
-                                           "[标注] 本局无法建立标注视图: %s" % e})
             gr = GameResult(games, result["moves"], result["winner"], cfg["board_size"],
-                            hole_mask=cfg["hole_mask"], label_game=label_game,
+                            hole_mask=cfg["hole_mask"],
                             score_diff=result.get("score_diff", 0.0),
-                            start_stones=cfg["start_stones"])
+                            start_stones=cfg["start_stones"],
+                            resigned=result.get("resigned", False))
             self.update_queue.put({"type": "game", "game_result": gr,
                                    "game_count": games, "loss": loss,
                                    "seconds": time.time() - t0,
-                                   "buffer": len(trainer.data_buffer)})
+                                   "buffer": len(trainer.data_buffer),
+                                   **({"komi": komi}
+                                      if cfg.get("komi_range", 0.0) > 0 else {})})
             if games % cfg["save_interval"] == 0:
                 p = trainer.save_model("g%06d" % games)
                 self.update_queue.put({"type": "log", "message": "[模型] 已保存: %s" % p})
@@ -1350,18 +1059,17 @@ class TrainingGUI:
                     self.game_history.append(gr)
                     if self.current_history_index == -1:
                         self.current_history_index = 0
-                        # 正在标注磁盘样本时不要被新对局顶掉视角；关闭标注后再看。
-                        if self.view_mode != "label":
-                            self._display_game(gr)
+                        self._display_game(gr)
                     if msg["loss"][0] is not None:
                         self.stats_panel.update_loss(*msg["loss"])
                     w = gr.winner
-                    res = result_text(w, gr.score_diff)
+                    res = result_text(w, gr.score_diff, gr.resigned)
                     if msg["loss"][0] is not None:
                         self._log_message(
-                            "[游戏 %d] %s | 手数 %d | %.1fs | 缓冲 %d | 平均 p=%.4f own=%.4f win=%.4f total=%.4f"
+                            "[游戏 %d] %s | 手数 %d | %.1fs | 缓冲 %d%s | 平均 p=%.4f own=%.4f win=%.4f total=%.4f"
                             % (msg["game_count"], res, len(gr.moves),
                                msg["seconds"], msg["buffer"],
+                               " | 贴目 %.1f" % msg["komi"] if "komi" in msg else "",
                                msg["loss"][0], msg["loss"][1],
                                msg["loss"][3], msg["loss"][4]))
                     else:
@@ -1373,10 +1081,6 @@ class TrainingGUI:
                     self._log_message("[训练] batch %d | 平均 p=%.4f own=%.4f win=%.4f total=%.4f"
                                       % (msg["batch"], msg["loss"][0], msg["loss"][1],
                                          msg["loss"][3], msg["loss"][4]))
-                elif typ == "search_progress":
-                    if msg["played"] % 10 == 0:
-                        self._log_message("[搜索] 第 %d 手（样本 %d）"
-                                          % (msg["played"], msg["samples"]))
                 elif typ == "log":
                     self._log_message(msg["message"])
                 elif typ == "stats":

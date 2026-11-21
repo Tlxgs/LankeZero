@@ -33,14 +33,19 @@ os.environ["OMP_DYNAMIC"] = "FALSE"
 def _utility(win_logit, score, alpha, scale):
     """把「胜率 logit + 目差（单位：目）」混成 [-1,1] 的效用。
 
-    score 现在一律是「目」：叶子用归属头逐点求和 + 贴目（见 margin_of），
-    终局用真实目差。两处口径一致，所以同一个函数就够。
-
+    score 现在一律是「目」：叶子用归属头逐点求和 + 贴目（见 margin_of）。
     scale 是 tanh 尺度（目），按**可落子面积**取 1.6·√面积，不是固定常数：
     固定 30 会让 9 路的 α 实际是「看目差」、19 路是「看胜负」。
     """
-    return ((1.0 - alpha) * math.tanh(win_logit)
-            + alpha * math.tanh(score / scale))
+    return _utility_parts(math.tanh(win_logit), score, alpha, scale)
+
+
+def _utility_parts(win, score, alpha, scale):
+    """同上，但胜率项已经是 [-1,1] 的效用值（终局直接给 ±1，不再过 tanh）。
+
+    终局和叶子必须共用这一个混合公式，否则 α≠0 时两者不在同一尺度上。
+    """
+    return (1.0 - alpha) * win + alpha * (score / scale)
 
 
 def margin_of(value, player, komi):
@@ -440,13 +445,34 @@ class MCTS:
     def _utility(self, win_logit, score):
         return _utility(win_logit, score, self.alpha, self._util_scale)
 
+    def _terminal_utility(self, win, score):
+        """终局用：win 已经是 ±1 的效用值，只和目差项按 α 混合。"""
+        return _utility_parts(win, score, self.alpha, self._util_scale)
+
     def _leaf_utility(self, win_logit, value, player, komi):
         """叶子值：胜率 + 归属头逐点和（换成含贴目的目差）。"""
         return self._utility(win_logit, margin_of(value, player, komi))
 
     def _terminal_value(self, game):
-        """终局叶子价值：具体口径交给规则（go 有 PASS 结算，五子棋没有）。"""
-        return self.rules.terminal_value(game, self._utility)
+        """终局叶子价值：具体口径交给规则（go 有 PASS 结算，五子棋没有）。
+
+        α=0 时就是纯胜负 ±1；α≠0 时和叶子走同一个混合公式，否则终局落在
+        另一套尺度上，搜索会比较「走到终局」和「继续下」的两种数值。
+        """
+        return self.rules.terminal_value(game, self._terminal_utility)
+
+    def root_value(self):
+        """根节点的搜索值（utility，[-1,1]，行棋方视角）：Σv / N。
+
+        自对弈认输判据读它：``(root_value()+1)/2`` 就是搜索给出的胜率。
+        没有根/没有访问时返回 0（= 五五开，不会触发认输）。
+        """
+        if self._root is None:
+            return 0.0
+        visits = int(self._visits[self._root])
+        if visits <= 0:
+            return 0.0
+        return float(self._vsum[self._root]) / visits
 
     def _search_indices(self, game, indices):
         """展开前剔除「自填单眼」，返回仍要展开的扁平下标。
@@ -471,9 +497,14 @@ class MCTS:
         return p[0], float(v[0]), float(w[0])
 
     def _batch_inference(self, states, legal_masks, global_features):
-        p, v, w = self.evaluator.evaluate(
-            np.stack(states), np.stack(legal_masks),
-            np.stack(global_features))
+        # states/masks/globs 允许已经是堆好的 ndarray，避免再 stack 一次。
+        if not isinstance(states, np.ndarray):
+            states = np.stack(states)
+        if not isinstance(legal_masks, np.ndarray):
+            legal_masks = np.stack(legal_masks)
+        if not isinstance(global_features, np.ndarray):
+            global_features = np.stack(global_features)
+        p, v, w = self.evaluator.evaluate(states, legal_masks, global_features)
         return list(p), v, w
 
     def init_root(self, game):

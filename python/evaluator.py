@@ -124,8 +124,8 @@ class GoEvaluator:
     def evaluate(self, states, legal_masks, global_features=None):
         """states: (B,INPUT_CHANNELS,n,n)；global_features: (B,GLOBAL_DIM)。
 
-        返回 (probs, values, win_logits)，均为 numpy。values 是归属头逐点求和
-        （≈ 当前行棋方视角的目差估计，含贴目）。
+        返回 (probs, values, win_logits)，均为 numpy。values 是 value 头输出
+        Σtanh(own)，即当前行棋方视角的「己方点数 - 对方点数」（不含贴目）。
         """
         states = np.asarray(states, dtype=np.float32)
         legal_masks = np.asarray(legal_masks, dtype=np.float32)
